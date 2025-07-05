@@ -152,7 +152,76 @@ int main(int argc, char* argv[]) {
         std::cerr << "[-] Only 64-bit PE files are supported in this example.\n";
         return 1;
     }
+    // Section headers start right after Optional Header
+    IMAGE_SECTION_HEADER sectionHeader;
+    std::cout << "\n=== Section Headers ===\n";
+    for (int i = 0; i < fileHeader.NumberOfSections; ++i) {
+        file.read(reinterpret_cast<char*>(&sectionHeader), sizeof(sectionHeader));
+        
+        std::cout << "Section Name: ";
+        for (int j = 0; j < 8 && sectionHeader.Name[j] != 0; ++j)
+            std::cout << sectionHeader.Name[j];
+            std::cout << "\n";
+            std::cout << "  Misc.VirtualSize     : "  << sectionHeader.Misc.VirtualSize << "\n";
+            std::cout << "  VirtualAddress       : "  << sectionHeader.VirtualAddress << "\n";
+            std::cout << "  SizeOfRawData        : "  << sectionHeader.SizeOfRawData << "\n";
+            std::cout << "  PointerToRawData     : "  << sectionHeader.PointerToRawData << "\n";
+            std::cout << "  PointerToRelocations : "  << sectionHeader.PointerToRelocations << "\n";
+            std::cout << "  PointerToLinenumbers : "  << sectionHeader.PointerToLinenumbers << "\n";
+            std::cout << "  NumberOfRelocations  : "  << sectionHeader.NumberOfRelocations << "\n";
+            std::cout << "  NumberOfLinenumbers  : "  << sectionHeader.NumberOfLinenumbers << "\n";
+            std::cout << "  Characteristics      : "  << sectionHeader.Characteristics << "\n";
 
+            std::cout << "------------------------------------\n";
+    }
+    // Read section headers
+    std::vector<IMAGE_SECTION_HEADER> sections(fileHeader.NumberOfSections);
+    for (int i = 0; i < fileHeader.NumberOfSections; ++i) {
+        file.read(reinterpret_cast<char*>(&sections[i]), sizeof(IMAGE_SECTION_HEADER));
+    }
+
+    std::cout << "\n=== RAW SECTION DATA DUMP ===\n";
+
+    for (int i = 0; i < fileHeader.NumberOfSections; ++i) {
+        
+        const auto& section = sections[1];
+
+        // Go to section raw data offset
+        if()
+        file.seekg(sections[0].PointerToRawData, std::ios::beg);
+
+        // Read raw bytes
+        std::vector<unsigned char> buffer(section.SizeOfRawData);
+        file.read(reinterpret_cast<char*>(buffer.data()), section.SizeOfRawData);
+
+        // Print section name
+        std::cout << "\nSection: ";
+        for (int j = 0; j < 8 && section.Name[j]; ++j)
+            std::cout << section.Name[j];
+            std::cout << "\nOffset: 0x" << std::hex << section.PointerToRawData;
+            std::cout << " | Size: 0x" << section.SizeOfRawData << "\n";
+
+            // Print hex dump
+            size_t width = 16;
+            for (size_t i = 0; i < buffer.size(); i += width) {
+            std::cout << std::hex << std::setw(8) << std::setfill('0') << i << ": ";
+            for (size_t j = 0; j < width; ++j) {
+                if (i + j < buffer.size())
+                    std::cout << std::setw(2) << static_cast<int>(buffer[i + j]) << " ";
+                else
+                    std::cout << "   ";
+            }
+            std::cout << " | ";
+            for (size_t j = 0; j < width; ++j) {
+                if (i + j < buffer.size()) {
+                    char c = static_cast<char>(buffer[i + j]);
+                    std::cout << (isprint(c) ? c : '.');
+                }
+            }
+            std::cout << "\n";
+        }
+        std::cout << "-----------------------------------\n";
+    }
     file.close();
     return 0;
 }
