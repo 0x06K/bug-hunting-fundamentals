@@ -174,54 +174,5 @@ int main(int argc, char* argv[]) {
 
             std::cout << "------------------------------------\n";
     }
-    // Read section headers
-    std::vector<IMAGE_SECTION_HEADER> sections(fileHeader.NumberOfSections);
-    for (int i = 0; i < fileHeader.NumberOfSections; ++i) {
-        file.read(reinterpret_cast<char*>(&sections[i]), sizeof(IMAGE_SECTION_HEADER));
-    }
-
-    std::cout << "\n=== RAW SECTION DATA DUMP ===\n";
-
-    for (int i = 0; i < fileHeader.NumberOfSections; ++i) {
-        
-        const auto& section = sections[1];
-
-        // Go to section raw data offset
-        if()
-        file.seekg(sections[0].PointerToRawData, std::ios::beg);
-
-        // Read raw bytes
-        std::vector<unsigned char> buffer(section.SizeOfRawData);
-        file.read(reinterpret_cast<char*>(buffer.data()), section.SizeOfRawData);
-
-        // Print section name
-        std::cout << "\nSection: ";
-        for (int j = 0; j < 8 && section.Name[j]; ++j)
-            std::cout << section.Name[j];
-            std::cout << "\nOffset: 0x" << std::hex << section.PointerToRawData;
-            std::cout << " | Size: 0x" << section.SizeOfRawData << "\n";
-
-            // Print hex dump
-            size_t width = 16;
-            for (size_t i = 0; i < buffer.size(); i += width) {
-            std::cout << std::hex << std::setw(8) << std::setfill('0') << i << ": ";
-            for (size_t j = 0; j < width; ++j) {
-                if (i + j < buffer.size())
-                    std::cout << std::setw(2) << static_cast<int>(buffer[i + j]) << " ";
-                else
-                    std::cout << "   ";
-            }
-            std::cout << " | ";
-            for (size_t j = 0; j < width; ++j) {
-                if (i + j < buffer.size()) {
-                    char c = static_cast<char>(buffer[i + j]);
-                    std::cout << (isprint(c) ? c : '.');
-                }
-            }
-            std::cout << "\n";
-        }
-        std::cout << "-----------------------------------\n";
-    }
-    file.close();
     return 0;
 }
