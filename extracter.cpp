@@ -19,7 +19,6 @@ DWORD RVAToFileOffset(DWORD rva, const std::vector<IMAGE_SECTION_HEADER>& sectio
     }
     return 0; // Invalid RVA
 }
-
 // Function to parse Import Table
 void ParseImportTable(std::ifstream& file, DWORD importRVA, DWORD importSize, 
                      const std::vector<IMAGE_SECTION_HEADER>& sections) {
