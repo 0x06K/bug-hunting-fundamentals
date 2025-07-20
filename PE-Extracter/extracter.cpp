@@ -313,7 +313,6 @@ int main(int argc, char* argv[]) {
         std::cout << "  Characteristics      : " << sectionHeader.Characteristics << "\n";
         std::cout << "------------------------------------\n";
     }
-
     // Parse Import Table
     ParseImportTable(file, optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress,
                      optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size, sections);
