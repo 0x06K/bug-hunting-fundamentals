@@ -279,9 +279,17 @@ int main(int argc, char* argv[]) {
         std::cout << "NumberOfRvaAndSizes      : " << optionalHeader.NumberOfRvaAndSizes << "\n";
 
         std::cout << "\n=== Data Directories ===\n";
-        for (int i = 0; i < optionalHeader.NumberOfRvaAndSizes && i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++i) {
-            std::cout << "[" << i << "] RVA: " << optionalHeader.DataDirectory[i].VirtualAddress
-                      << ", Size: " << optionalHeader.DataDirectory[i].Size << "\n";
+        const char* dirNames[16] = {
+            "Export Table", "Import Table", "Resource Table", "Exception Table",
+            "Certificate Table", "Base Relocation Table", "Debug Directory", "Architecture",
+            "Global Ptr", "TLS Table", "Load Config Table", "Bound Import",
+            "IAT (Import Address)", "Delay Import Descriptor", "CLR Runtime Header", "Reserved"
+        };
+
+        for (int i = 0; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; i++) {
+            DWORD rva = optionalHeader.DataDirectory[i].VirtualAddress;
+            DWORD size = optionalHeader.DataDirectory[i].Size;
+            printf("[0x%02X] %-23s RVA: 0x%08X, Size: 0x%08X\n", i, dirNames[i], rva, size);
         }
 
     } else {
