@@ -1,216 +1,61 @@
 #include <windows.h>
+#include <winternl.h>
 #include <stdio.h>
 using namespace std;
 
-BYTE* LoadFileToMemory(const char* filePath, DWORD* outSize) {
-    HANDLE hFile = CreateFileA(filePath, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        printf("[-] Failed to open file: %s\n", filePath);
-        return NULL;
-    }
+/*
+    User clicks → Explorer → ShellExecute → CreateProcess → NtCreateUserProcess →
+        ↳ Object Manager opens file
+        ↳ PE image mapped via section
+        ↳ Kernel parses PE headers
+        ↳ Thread, memory, and stack created
+        ↳ Transition to user-mode stub in NTDLL
+            ↳ Loads DLLs via LdrLoadDll
+            ↳ Resolves imports
+            ↳ Calls entry point
+*/
 
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
-        printf("[-] Invalid file size.\n");
-        CloseHandle(hFile);
-        return NULL;
-    }
+/*
+    PE file reading → NtCreateFile() + NtReadFile() for target executable
+    PE header validation → DOS/NT headers and signature checks
+    Image memory allocation → NtAllocateVirtualMemory() at preferred base
+    Section mapping → Copy PE sections to virtual addresses
+    Import resolution → Load DLLs and resolve function addresses
+    Relocation processing → Fix addresses if base changed
+    Memory protection → NtProtectVirtualMemory() for section permissions
+    TLS initialization → Thread Local Storage callbacks
+    DLL entry points → DllMain() calls in dependency order
+    Thread scheduling → Add to scheduler ready queue
+    Context switch → Jump to executable entry point
+    Program execution → Your main() function runs
 
-    BYTE* buffer = (BYTE*)malloc(fileSize);
-    if (!buffer) {
-        printf("[-] Memory allocation failed.\n");
-        CloseHandle(hFile);
-        return NULL;
-    }
-
-    DWORD bytesRead = 0;
-    if (!ReadFile(hFile, buffer, fileSize, &bytesRead, NULL) || bytesRead != fileSize) {
-        printf("[-] Failed to read the full file.\n");
-        free(buffer);
-        CloseHandle(hFile);
-        return NULL;
-    }
-
-    CloseHandle(hFile);
-    *outSize = fileSize;
-    return buffer;
-}
-
+    Result: Your program runs exactly as if Windows loaded it, but you control every step of the process.
+*/
 int main(int argc, char* argv[]) {
-    
-    if (argc != 2) {
-        printf("Usage: %s <target.exe>\n", argv[0]);
-        return 1;
-    }
-    
-    DWORD fileSize = 0;
-    BYTE* peBuffer = LoadFileToMemory(argv[1], &fileSize);
-    
-    if (!peBuffer) {
-        printf("[-] Could not load file into memory.\n");
-        return -1;
-    }
+    // Gets the pointer to the Process Environment Block (PEB) in 64-bit user-mode.
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    PLDR_DATA_TABLE_ENTRY pEntry = (PLDR_DATA_TABLE_ENTRY)pPeb->Ldr->InMemoryOrderModuleList.Flink;
+    PVOID ntdllBase = pEntry->DllBase;
+    // Parse its PE headers to find export directory
 
-    printf("[+] PE file loaded. Size: %lu bytes\n", fileSize);
 
-    // 🔜 Next step: parse headers
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)peBuffer;
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-        printf("[-] Invalid DOS signature.\n");
-        return -1;
-    }
 
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(peBuffer + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-        printf("[-] Invalid NT signature.\n");
-        return -1;
-    }
-
-    printf("[+] Valid PE file. Entry point RVA: 0x%X\n", ntHeaders->OptionalHeader.AddressOfEntryPoint);
-    LPVOID imageBase = VirtualAlloc(
-        (LPVOID)ntHeaders->OptionalHeader.ImageBase,
-        ntHeaders->OptionalHeader.SizeOfImage,
-        MEM_RESERVE | MEM_COMMIT,
-        PAGE_EXECUTE_READWRITE
-    );
-
-    if (!imageBase) {
-        // If preferred base is taken, allocate anywhere
-        imageBase = VirtualAlloc(
-            NULL,
-            ntHeaders->OptionalHeader.SizeOfImage,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_EXECUTE_READWRITE
-        );
-
-        if (!imageBase) {
-            printf("[-] Memory allocation failed.\n");
-            return -1;
-        }
-    }
-    // Copy headers
-    memcpy(imageBase, peBuffer, ntHeaders->OptionalHeader.SizeOfHeaders);
-
-    // Copy sections
-    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeaders);
-    for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++, section++) {
-        LPVOID dest = (LPVOID)((DWORD_PTR)imageBase + section->VirtualAddress);
-        LPVOID src  = (LPVOID)(peBuffer + section->PointerToRawData);
-        memcpy(dest, src, section->SizeOfRawData);
-    }
-    DWORD_PTR delta = (DWORD_PTR)imageBase - ntHeaders->OptionalHeader.ImageBase;
-
-    if (delta != 0 && ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0) {
-        PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)((DWORD_PTR)imageBase +
-            ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-
-        DWORD relocSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-        DWORD bytesProcessed = 0;
-
-        while (bytesProcessed < relocSize && reloc->SizeOfBlock > 0) {
-            DWORD relocCount = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* relocData = (WORD*)((DWORD_PTR)reloc + sizeof(IMAGE_BASE_RELOCATION));
-
-            for (DWORD i = 0; i < relocCount; i++) {
-                WORD entry = relocData[i];
-                DWORD type = entry >> 12;         // upper 4 bits
-                DWORD offset = entry & 0x0FFF;    // lower 12 bits
-
-                if (type == IMAGE_REL_BASED_DIR64) {
-                    // 64-bit relocation
-                    DWORD_PTR* patchAddr = (DWORD_PTR*)((DWORD_PTR)imageBase + reloc->VirtualAddress + offset);
-                    *patchAddr += delta;
-                } else if (type == IMAGE_REL_BASED_HIGHLOW) {
-                    // 32-bit relocation
-                    DWORD* patchAddr = (DWORD*)((DWORD_PTR)imageBase + reloc->VirtualAddress + offset);
-                    *patchAddr += (DWORD)delta;
-                } else if (type == IMAGE_REL_BASED_ABSOLUTE) {
-                    // No relocation needed
-                } else {
-                    printf("[-] Unknown relocation type: %d\n", type);
-                }
-            }
-
-            bytesProcessed += reloc->SizeOfBlock;
-            reloc = (PIMAGE_BASE_RELOCATION)((DWORD_PTR)reloc + reloc->SizeOfBlock);
-        }
-
-        printf("[+] Base relocations applied.\n");
-    } else {
-        printf("[=] No base relocations needed.\n");
-    }
-    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(
-        (DWORD_PTR)imageBase + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress
-    );
-
-    while (importDesc->Name) {
-        const char* dllName = (const char*)((DWORD_PTR)imageBase + importDesc->Name);
-        HMODULE hDll = LoadLibraryA(dllName);
-
-        if (!hDll) {
-            printf("[-] Failed to load dependency: %s\n", dllName);
-            return -1;
-        }
-
-        // OriginalFirstThunk = names (for resolving)
-        // FirstThunk = where resolved addresses go (IAT)
-        PIMAGE_THUNK_DATA origFirstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDesc->OriginalFirstThunk);
-        PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)imageBase + importDesc->FirstThunk);
-
-        while (origFirstThunk->u1.AddressOfData) {
-            FARPROC funcAddr = NULL;
-
-            if (origFirstThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
-                // Import by ordinal
-                WORD ordinal = IMAGE_ORDINAL(origFirstThunk->u1.Ordinal);
-                funcAddr = GetProcAddress(hDll, (LPCSTR)ordinal);
-            } else {
-                // Import by name
-                PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)imageBase + origFirstThunk->u1.AddressOfData);
-                funcAddr = GetProcAddress(hDll, (LPCSTR)importByName->Name);
-            }
-
-            if (!funcAddr) {
-                printf("[-] Failed to resolve import.\n");
-                return -1;
-            }
-
-            // Write resolved address into IAT
-            firstThunk->u1.Function = (DWORD_PTR)funcAddr;
-
-            origFirstThunk++;
-            firstThunk++;
-        }
-
-        importDesc++;
-    }
-
-    printf("[+] Imports resolved.\n");
-
-    DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-    /* 
-        void (*exeEntryPoint)() = pointer to function()
-        (void (*)())((DWORD_PTR) = treating the addr as func() 
-               which returns nothing takes no argument
-    */
-    void (*exeEntryPoint)() = (void (*)())((DWORD_PTR)imageBase + entryPointRVA);
-    
-    printf("[+] OptionalHeader.AddressOfEntryPoint = %p\n[+] ImageBase = %p\n", 
-                        ntHeaders->OptionalHeader.AddressOfEntryPoint, imageBase);
-    printf("[*] Jumping to entry point at: %p\n", exeEntryPoint);
-    BYTE* codeStart = (BYTE*)imageBase + entryPointRVA;
-    if ((codeStart[0] == 0x55 && codeStart[1] == 0x8B) ||         // 32-bit: push ebp; mov ebp, esp
-    (codeStart[0] == 0x48 && codeStart[1] == 0x83)) {         // 64-bit: sub rsp, ...
-    printf("[=] Looks like a normal function prologue (push ebp; mov ebp, esp)\n");
-    } else if (codeStart[0] == 0xE9 || codeStart[0] == 0xEB) {
-        printf("[=] Entry point starts with a jump — could be legit or suspicious.\n");
-    } else {
-        printf("[?] Unusual bytes at entry point: 0x%02X 0x%02X\n", codeStart[0], codeStart[1]);
-    }
-    printf("[=] First few bytes at entry point: %02X %02X %02X %02X %02X\n",
-       codeStart[0], codeStart[1], codeStart[2], codeStart[3], codeStart[4]);
-    exeEntryPoint();  //  control transferred to loaded image
-
-    free(peBuffer);
     return 0;
 }
+
+/*
+=== Basic Signature of NtCreateFile() ===
+    NTSTATUS NtCreateFile(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength
+    );
+*/
