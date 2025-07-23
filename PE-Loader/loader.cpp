@@ -188,10 +188,28 @@ int main(int argc, char* argv[]) {
     printf("[+] Imports resolved.\n");
 
     DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    /* 
+        void (*exeEntryPoint)() = pointer to function()
+        (void (*)())((DWORD_PTR) = treating the addr as func() 
+               which returns nothing takes no argument
+    */
     void (*exeEntryPoint)() = (void (*)())((DWORD_PTR)imageBase + entryPointRVA);
-
+    
+    printf("[+] OptionalHeader.AddressOfEntryPoint = %p\n[+] ImageBase = %p\n", 
+                        ntHeaders->OptionalHeader.AddressOfEntryPoint, imageBase);
     printf("[*] Jumping to entry point at: %p\n", exeEntryPoint);
-    exeEntryPoint();  // 🚀 control transferred to loaded image
+    BYTE* codeStart = (BYTE*)imageBase + entryPointRVA;
+    if ((codeStart[0] == 0x55 && codeStart[1] == 0x8B) ||         // 32-bit: push ebp; mov ebp, esp
+    (codeStart[0] == 0x48 && codeStart[1] == 0x83)) {         // 64-bit: sub rsp, ...
+    printf("[=] Looks like a normal function prologue (push ebp; mov ebp, esp)\n");
+    } else if (codeStart[0] == 0xE9 || codeStart[0] == 0xEB) {
+        printf("[=] Entry point starts with a jump — could be legit or suspicious.\n");
+    } else {
+        printf("[?] Unusual bytes at entry point: 0x%02X 0x%02X\n", codeStart[0], codeStart[1]);
+    }
+    printf("[=] First few bytes at entry point: %02X %02X %02X %02X %02X\n",
+       codeStart[0], codeStart[1], codeStart[2], codeStart[3], codeStart[4]);
+    exeEntryPoint();  //  control transferred to loaded image
 
     free(peBuffer);
     return 0;
