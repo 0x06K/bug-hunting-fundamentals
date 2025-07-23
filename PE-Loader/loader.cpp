@@ -59,3 +59,66 @@ int main(int argc, char* argv[]) {
     ULONG EaLength
     );
 */
+/*
+    PEB structure blueprint
+    typedef struct _PEB {
+        BYTE                          InheritedAddressSpace;
+        BYTE                          ReadImageFileExecOptions;
+        BYTE                          BeingDebugged;
+        BYTE                          BitField;
+        PVOID                         Mutant;
+        PVOID                         ImageBaseAddress;
+        struct _PEB_LDR_DATA*         Ldr; --> [we are concerened with this for now]
+        struct _RTL_USER_PROCESS_PARAMETERS* ProcessParameters;
+        PVOID                         SubSystemData;
+        PVOID                         ProcessHeap;
+        PVOID                         FastPebLock;
+        PVOID                         AtlThunkSListPtr;
+        PVOID                         IFEOKey;
+        // ... many more fields
+    } PEB, *PPEB;
+_____________________________________________________________________________________________________
+
+    typedef struct _PEB_LDR_DATA {
+        ULONG Length;
+        BOOLEAN Initialized;
+        PVOID SsHandle;
+
+        LIST_ENTRY InLoadOrderModuleList;        // Points to InLoadOrderLinks in each module
+        LIST_ENTRY InMemoryOrderModuleList;      // Points to InMemoryOrderLinks in each module
+        LIST_ENTRY InInitializationOrderModuleList; // Points to InInitializationOrderLinks
+
+        // Other internal fields may follow
+    } PEB_LDR_DATA, *PPEB_LDR_DATA;
+_____________________________________________________________________________________________________
+    
+    typedef struct _LIST_ENTRY {
+        struct _LIST_ENTRY* Flink;  // Next node
+        struct _LIST_ENTRY* Blink;  // Previous node
+    } LIST_ENTRY, *PLIST_ENTRY;
+    
+    points to the struct below
+_____________________________________________________________________________________________________
+
+    typedef struct _LDR_DATA_TABLE_ENTRY {
+        LIST_ENTRY InLoadOrderLinks;          // Next/Prev in load order
+        LIST_ENTRY InMemoryOrderLinks;        // Next/Prev in memory order
+        LIST_ENTRY InInitializationOrderLinks;// Next/Prev in init order
+        PVOID DllBase;                        // Base address of module
+        PVOID EntryPoint;                     // Entry point of module
+        ULONG SizeOfImage;                    // Size of the image
+        UNICODE_STRING FullDllName;           // Full path of the DLL
+        UNICODE_STRING BaseDllName;           // Just the name (e.g. "kernel32.dll")
+        ...
+    } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+    PEB
+    └── Ldr (PEB_LDR_DATA)
+        └── InMemoryOrderModuleList (LIST_ENTRY)   ← list head (not a module)
+            └── Flink → [module1]->InMemoryOrderLinks
+                        └── Flink → [module2]->InMemoryOrderLinks
+                                    ...
+                        └── Blink ← prev module
+
+
+*/
