@@ -31,15 +31,62 @@ using namespace std;
 
     Result: Your program runs exactly as if Windows loaded it, but you control every step of the process.
 */
+FARPROC GetProcAddressManual(PVOID ntdllBase, const char* targetName) {
+    
+    return NULL;
+}
+
 int main(int argc, char* argv[]) {
+
+    /* FLow is like this {PEB} has member pointer of type PEB_LDR_DATA named
+     Ldr which points to -> member of PEB_LDR_DATA InMemoryOrderModuleList of
+      type LIST_ENTRY(circullar double linked list) that points to -> a an object
+       of PLDR_DATA_TABLE_ENTRY which contains the information of one module it has
+        a pointer (LIST_ENTRY InMemoryOrderLinks) it points to other table entries */
+    /* think of it like you have a main class PEB which contains the pointer 
+    of clas PEB_LDR_DATA to store the addr of its object that pointer points 
+    to that object and now that object has a member of type LIST_ENTRY which 
+    is a circular doubly linked list now this list points to another data structure
+     named PEB_LDR_DATA_TABLE_ENTRY which contains information of one module
+      it has a pointer (LIST_ENTRY InMemoryOrderLinks) that points to other 
+      PLDR_DATA_TABLE_ENTRIES. So in simple terms flow is like this:
+
+    PEB -> PEB_LDR_DATA* -> PEB_LDR_DATA -> LIST_ENTRY(circulardoublylinkedlist).Flink*
+     -> PLDR_DATA_TABLE_ENTRIES
+
+    */
     // Gets the pointer to the Process Environment Block (PEB) in 64-bit user-mode.
     PPEB pPeb = (PPEB)__readgsqword(0x60);
-    PLDR_DATA_TABLE_ENTRY pEntry = (PLDR_DATA_TABLE_ENTRY)pPeb->Ldr->InMemoryOrderModuleList.Flink;
+    // realigns the pointer to structure PLDR_DATA_TABLE_ENTRY which contains the module information
+    PLDR_DATA_TABLE_ENTRY pEntry = 
+    (PLDR_DATA_TABLE_ENTRY)((BYTE*)pPeb->Ldr->InMemoryOrderModuleList.Flink->Flink - 0x10);
+    // just stored the module base addr
     PVOID ntdllBase = pEntry->DllBase;
-    // Parse its PE headers to find export directory
 
-
-
+    // Parse Headers
+    // Dos headers
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)ntdllBase;
+    // NT headers
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)ntdllBase + dos->e_lfanew);
+    // get to export directory
+    IMAGE_DATA_DIRECTORY exportDirData = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)ntdllBase + exportDirData.VirtualAddress);
+    /* when we perform pointer airthmetic in the end it depends on pointer that how much byte it points to original
+    like: (BYTE*)ntdllBase + exportDirData.VirtualAddress will return a pointer to a byte. but int* ptr = &a;ptr++ will give pointer to 
+    integer means 4 bytes. (BYTE*)ntdllBase + 0xsomething in the end a pointer to a byte will be returned. */
+    DWORD* nameRvas = (DWORD*)((BYTE*)ntdllBase + exportDir->AddressOfNames);
+    WORD* ordinals = (WORD*)((BYTE*)ntdllBase + exportDir->AddressOfNameOrdinals);
+    DWORD* funcRvas = (DWORD*)((BYTE*)ntdllBase + exportDir->AddressOfFunctions);
+    for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+        char* funcName = (char*)(ntdllBase + nameRvas[i]);
+        if (strcmp(funcName, "NtCreateFile") == 0) {
+            WORD ordinal = ordinals[i];
+            DWORD funcRVA = funcRvas[ordinal];
+            void* ntCreateFileAddr = (BYTE*)ntdllBase + funcRVA;
+            break;
+        }
+    }
+    
     return 0;
 }
 
@@ -58,6 +105,63 @@ int main(int argc, char* argv[]) {
     PVOID EaBuffer,
     ULONG EaLength
     );
+=== IMAGE_DOS_HEADER ===
+typedef struct _IMAGE_DOS_HEADER {
+    WORD   e_magic;     // "MZ"
+    WORD   e_cblp;
+    WORD   e_cp;
+    WORD   e_crlc;
+    WORD   e_cparhdr;
+    WORD   e_minalloc;
+    WORD   e_maxalloc;
+    WORD   e_ss;
+    WORD   e_sp;
+    WORD   e_csum;
+    WORD   e_ip;
+    WORD   e_cs;
+    WORD   e_lfarlc;
+    WORD   e_ovno;
+    WORD   e_res[4];
+    WORD   e_oemid;
+    WORD   e_oeminfo;
+    WORD   e_res2[10];
+    LONG   e_lfanew;    // File offset to PE header
+} IMAGE_DOS_HEADER, *PIMAGE_DOS_HEADER;
+
+=== IMAGE_NT_HEADERS64 ===
+typedef struct _IMAGE_NT_HEADERS64 {
+    DWORD Signature;  // "PE\0\0"
+    IMAGE_FILE_HEADER FileHeader;
+    IMAGE_OPTIONAL_HEADER64 OptionalHeader;
+} IMAGE_NT_HEADERS64, *PIMAGE_NT_HEADERS64;
+
+=== IMAGE_OPTIONAL_HEADER64 ===
+typedef struct _IMAGE_OPTIONAL_HEADER64 {
+    ...
+    IMAGE_DATA_DIRECTORY DataDirectory[16];       // Array of directories
+} IMAGE_OPTIONAL_HEADER64, *PIMAGE_OPTIONAL_HEADER64;
+
+=== IMAGE_DATA_DIRECTORY ===
+typedef struct _IMAGE_DATA_DIRECTORY {
+    DWORD VirtualAddress;     // RVA to the structure
+    DWORD Size;
+} IMAGE_DATA_DIRECTORY, *PIMAGE_DATA_DIRECTORY;
+
+=== IMAGE_EXPORT_DIRECTORY ===
+typedef struct _IMAGE_EXPORT_DIRECTORY {
+    DWORD Characteristics;
+    DWORD TimeDateStamp;
+    WORD  MajorVersion;
+    WORD  MinorVersion;
+    DWORD Name;                       // RVA of DLL name
+    DWORD Base;
+    DWORD NumberOfFunctions;
+    DWORD NumberOfNames;
+    DWORD AddressOfFunctions;        // RVA to DWORD array of function RVAs
+    DWORD AddressOfNames;            // RVA to DWORD array of names (RVA to ASCII strings)
+    DWORD AddressOfNameOrdinals;     // RVA to WORD array of ordinals
+} IMAGE_EXPORT_DIRECTORY, *PIMAGE_EXPORT_DIRECTORY;
+
 */
 /*
     PEB structure blueprint
