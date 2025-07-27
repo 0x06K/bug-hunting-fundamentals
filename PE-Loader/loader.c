@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
-using namespace std;
 
 // Function pointer typedefs for all resolved functions
 typedef NTSTATUS (WINAPI *pNtCreateFile)(
@@ -304,58 +303,87 @@ int main(int argc, char* argv[]) {
     SIZE_T sizeOfHeaders = ntHeader->OptionalHeader.SizeOfHeaders;
     memcpy(base, fileBuffer, sizeOfHeaders);
     IMAGE_DOS_HEADER* basedosHeader = (IMAGE_DOS_HEADER*)base;
-    IMAGE_NT_HEADERS* ntbaseHeaders = (IMAGE_NT_HEADERS*)((BYTE*)base + dosHeader->e_lfanew);
-    IMAGE_SECTION_HEADER* sectionHeader = IMAGE_FIRST_SECTION(ntbaseHeaders);
+    IMAGE_NT_HEADERS* ntBaseHeader = (IMAGE_NT_HEADERS*)((BYTE*)base + dosHeader->e_lfanew);
+    IMAGE_SECTION_HEADER* sectionHeader = IMAGE_FIRST_SECTION(ntBaseHeader);
 
-    for (int i = 0; i < ntbaseHeaders->FileHeader.NumberOfSections; i++, sectionHeader++)
+    for (int i = 0; i < ntBaseHeader->FileHeader.NumberOfSections; i++, sectionHeader++)
         memcpy((BYTE*)base + sectionHeader->VirtualAddress,
        (BYTE*)fileBuffer + sectionHeader->PointerToRawData,
        sectionHeader->SizeOfRawData);
-    if (ntbaseHeaders->OptionalHeader.ImageBase != (DWORD_PTR)base){
-        printf("[-] Base is not same.");
-        printf("[+] Applying Relocations.");
-        
-        uintptr_t delta = (uintptr_t)base - ntbaseHeaders->OptionalHeader.ImageBase;
-        DWORD relocRVA = ntbaseHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-        DWORD relocSize = ntbaseHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-        IMAGE_BASE_RELOCATION* reloc = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
-        
-        DWORD parsedSize = 0;
-        while (parsedSize < relocSize && reloc->SizeOfBlock > 0) {
-            BYTE* relocBlock = (BYTE*)reloc;
-            DWORD blockVA = reloc->VirtualAddress;
-            DWORD blockSize = reloc->SizeOfBlock;
-
-            int entryCount = (blockSize - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* entries = (WORD*)(relocBlock + sizeof(IMAGE_BASE_RELOCATION));
-
-            for (int i = 0; i < entryCount; i++) {
-                WORD entry = entries[i];
-                WORD type = entry >> 12;
-                WORD offset = entry & 0xFFF;
-
-                if (type == IMAGE_REL_BASED_HIGHLOW) {
-                    DWORD* patchAddr = (DWORD*)((BYTE*)base + blockVA + offset);
-                    *patchAddr += delta;
+    
+    if (ntBaseHeader->OptionalHeader.ImageBase != (DWORD_PTR)base){
+        printf("[-] Base Relocation needed.\n");
+        ptrdiff_t delta = (BYTE*)base - (BYTE*)(ntBaseHeader->OptionalHeader.ImageBase);
+        DWORD relocRVA = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        DWORD relocSize = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+        IMAGE_BASE_RELOCATION* relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
+        printf("[+] Applying Relocations.\n");
+        while(relocSize > 0){
+        WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
+        int entryCount = (relocBase->SizeOfBlock-8)/2;
+        for(DWORD i = 0; i < entryCount; i++) {
+            WORD entry = relocEntries[i];  // Get the i-th entry
+            WORD type = (entry >> 12) & 0xF;
+            WORD offset = entry & 0xFFF;
+                switch(type){
+                    case IMAGE_REL_BASED_ABSOLUTE: 
+                        // No relocation needed
+                        break;
+                    case IMAGE_REL_BASED_HIGH:
+                        // High 16 bits of 32-bit address
+                        *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += HIWORD(delta);
+                        break;
+                    case IMAGE_REL_BASED_LOW:
+                        // Low 16 bits of 32-bit address  
+                        *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += LOWORD(delta);
+                        break;
+                    case IMAGE_REL_BASED_HIGHLOW:
+                        // Full 32-bit address
+                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                        break;
+                    case IMAGE_REL_BASED_HIGHADJ:
+                        // 32-bit high-adjusted
+                        {
+                            WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8);
+                            WORD highPart = *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset);
+                            WORD lowPart = relocEntries[++i] & 0xFFFF;
+                            DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
+                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) = HIWORD(fullAddr);
+                        }
+                        break;
+                    case IMAGE_REL_BASED_MIPS_JMPADDR:
+                        // MIPS/ARM 32-bit
+                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                        break;
+                    case 6:
+                        // Your observed type 6
+                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                        break;
+                    case IMAGE_REL_BASED_THUMB_MOV32:
+                        // ARM Thumb MOV32
+                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                        break;
+                    case IMAGE_REL_BASED_MIPS_JMPADDR16:
+                        // MIPS16 or IA64 64-bit
+                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                        break;
+                    case IMAGE_REL_BASED_DIR64:
+                        // 64-bit address
+                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                        break;
+                    default:
+                        printf("[-] Unsupported relocation type: %d\n", type);
+                        return -1;
                 }
             }
-
-            parsedSize += blockSize;
-            reloc = (IMAGE_BASE_RELOCATION*)(relocBlock + blockSize);
+            relocSize -= relocBase->SizeOfBlock;
+            if(!relocSize) break;
+            relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
         }
-        IMAGE_DATA_DIRECTORY importDir = ntbaseHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-        if (importDir.VirtualAddress == 0) {
-            // No imports — you’re done with this step
-            printf("[+] we are done with this.");
-        }
-
-
-        return 0;
     }
-
     return 0;
-}
 
+}
 
 /*
 
