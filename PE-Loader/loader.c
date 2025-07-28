@@ -381,7 +381,18 @@ int main(int argc, char* argv[]) {
             if(!relocSize) break;
             relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
         }
+    } else {
+        printf("[+] No base relocation needed.");
     }
+    
+    // Step3:  Patch the Import Address Table (IAT) 
+    IMAGE_IMPORT_DESCRIPTOR* IT = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)base + ntBaseHeader->OptionalHeader.DataDirectory[1].VirtualAddress);
+    while(IT->Name){
+        char* dllName = (char*)((BYTE*)base + IT->Name);
+        printf("DLL: %s\n", dllName);
+        IT++;
+    }
+
     return 0;
 
 }
