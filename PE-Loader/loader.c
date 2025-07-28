@@ -325,6 +325,7 @@ int main(int argc, char* argv[]) {
             WORD entry = relocEntries[i];  // Get the i-th entry
             WORD type = (entry >> 12) & 0xF;
             WORD offset = entry & 0xFFF;
+            // we need to add base because these offsets are not relative to .reloc section but base.
                 switch(type){
                     case IMAGE_REL_BASED_ABSOLUTE: 
                         // No relocation needed
