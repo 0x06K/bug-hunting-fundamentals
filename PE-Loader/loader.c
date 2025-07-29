@@ -310,89 +310,128 @@ int main(int argc, char* argv[]) {
         memcpy((BYTE*)base + sectionHeader->VirtualAddress,
        (BYTE*)fileBuffer + sectionHeader->PointerToRawData,
        sectionHeader->SizeOfRawData);
-    
     if (ntBaseHeader->OptionalHeader.ImageBase != (DWORD_PTR)base){
         printf("[-] Base Relocation needed.\n");
         ptrdiff_t delta = (BYTE*)base - (BYTE*)(ntBaseHeader->OptionalHeader.ImageBase);
         DWORD relocRVA = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
         DWORD relocSize = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
         IMAGE_BASE_RELOCATION* relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
-        printf("[+] Applying Relocations.\n");
+        
         while(relocSize > 0){
-        WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
-        int entryCount = (relocBase->SizeOfBlock-8)/2;
-        for(DWORD i = 0; i < entryCount; i++) {
-            WORD entry = relocEntries[i];  // Get the i-th entry
-            WORD type = (entry >> 12) & 0xF;
-            WORD offset = entry & 0xFFF;
-            // we need to add base because these offsets are not relative to .reloc section but base.
-                switch(type){
-                    case IMAGE_REL_BASED_ABSOLUTE: 
-                        // No relocation needed
-                        break;
-                    case IMAGE_REL_BASED_HIGH:
-                        // High 16 bits of 32-bit address
-                        *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += HIWORD(delta);
-                        break;
-                    case IMAGE_REL_BASED_LOW:
-                        // Low 16 bits of 32-bit address  
-                        *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += LOWORD(delta);
-                        break;
-                    case IMAGE_REL_BASED_HIGHLOW:
-                        // Full 32-bit address
-                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                        break;
-                    case IMAGE_REL_BASED_HIGHADJ:
-                        // 32-bit high-adjusted
-                        {
-                            WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8);
-                            WORD highPart = *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset);
-                            WORD lowPart = relocEntries[++i] & 0xFFFF;
-                            DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
-                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) = HIWORD(fullAddr);
-                        }
-                        break;
-                    case IMAGE_REL_BASED_MIPS_JMPADDR:
-                        // MIPS/ARM 32-bit
-                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                        break;
-                    case 6:
-                        // Your observed type 6
-                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                        break;
-                    case IMAGE_REL_BASED_THUMB_MOV32:
-                        // ARM Thumb MOV32
-                        *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                        break;
-                    case IMAGE_REL_BASED_MIPS_JMPADDR16:
-                        // MIPS16 or IA64 64-bit
-                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                        break;
-                    case IMAGE_REL_BASED_DIR64:
-                        // 64-bit address
-                        *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                        break;
-                    default:
-                        printf("[-] Unsupported relocation type: %d\n", type);
-                        return -1;
+            printf("[+] Size of Block: %d\n",relocSize);
+            WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
+            int entryCount = (relocBase->SizeOfBlock-8)/2;
+            for(DWORD i = 0; i < entryCount; i++) {
+                WORD entry = relocEntries[i];  // Get the i-th entry
+                WORD type = (entry >> 12) & 0xF;
+                WORD offset = entry & 0xFFF;
+                // we need to add base because these offsets are not relative to .reloc section but base.
+                    switch(type){
+                        case IMAGE_REL_BASED_ABSOLUTE: 
+                            // No relocation needed
+                            break;
+                        case IMAGE_REL_BASED_HIGH:
+                            // High 16 bits of 32-bit address
+                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += HIWORD(delta);
+                            break;
+                        case IMAGE_REL_BASED_LOW:
+                            // Low 16 bits of 32-bit address  
+                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += LOWORD(delta);
+                            break;
+                        case IMAGE_REL_BASED_HIGHLOW:
+                            // Full 32-bit address
+                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                            break;
+                        case IMAGE_REL_BASED_HIGHADJ:
+                            // 32-bit high-adjusted
+                            {
+                                WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8);
+                                WORD highPart = *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset);
+                                WORD lowPart = relocEntries[++i] & 0xFFFF;
+                                DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
+                                *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) = HIWORD(fullAddr);
+                            }
+                            break;
+                        case IMAGE_REL_BASED_MIPS_JMPADDR:
+                            // MIPS/ARM 32-bit
+                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                            break;
+                        case 6:
+                            // Your observed type 6
+                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                            break;
+                        case IMAGE_REL_BASED_THUMB_MOV32:
+                            // ARM Thumb MOV32
+                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
+                            break;
+                        case IMAGE_REL_BASED_MIPS_JMPADDR16:
+                            // MIPS16 or IA64 64-bit
+                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                            break;
+                        case IMAGE_REL_BASED_DIR64:
+                            // 64-bit address
+                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
+                            break;
+                        default:
+                            printf("[-] Unsupported relocation type: %d\n", type);
+                            return -1;
+                    }
                 }
+                relocSize -= relocBase->SizeOfBlock;
+                if(!relocSize) break;
+                relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
             }
-            relocSize -= relocBase->SizeOfBlock;
-            if(!relocSize) break;
-            relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
-        }
+            printf("[+] Relocations Applied.\n");
     } else {
         printf("[+] No base relocation needed.");
     }
     
-    // Step3:  Patch the Import Address Table (IAT) 
-    IMAGE_IMPORT_DESCRIPTOR* IT = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)base + ntBaseHeader->OptionalHeader.DataDirectory[1].VirtualAddress);
-    while(IT->Name){
+    IMAGE_IMPORT_DESCRIPTOR* IT = (IMAGE_IMPORT_DESCRIPTOR*)((BYTE*)base +
+    ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    int i = 0;
+    while (IT->Name != 0) {
         char* dllName = (char*)((BYTE*)base + IT->Name);
-        printf("DLL: %s\n", dllName);
+
+        // Use FirstThunk instead of OriginalFirstThunk if OFT is zero
+        DWORD thunkRVA = IT->OriginalFirstThunk ? IT->OriginalFirstThunk : IT->FirstThunk;
+        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((BYTE*)base + thunkRVA);
+        PIMAGE_IMPORT_BY_NAME import;
+        WORD ordinal;
+        while (origThunk->u1.AddressOfData != 0) {
+            if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
+                ordinal = IMAGE_ORDINAL(origThunk->u1.Ordinal);
+            } else {
+                import = (PIMAGE_IMPORT_BY_NAME)((BYTE*)base + origThunk->u1.AddressOfData);
+
+                // Safe guard
+                if (IsBadReadPtr(import, sizeof(IMAGE_IMPORT_BY_NAME))) break;
+            }
+            char mName[256];
+            do {
+                int result = WideCharToMultiByte(
+                    CP_ACP,            // Code page (CP_UTF8 for UTF-8)
+                    0,                 // Flags
+                    ((PLDR_DATA_TABLE_ENTRY)((BYTE*)pPeb->Ldr->InMemoryOrderModuleList.Flink->Flink - 0x10))->FullDllName.Buffer,           // Source wide string
+                    -1,                // Null-terminated
+                    mName,           // Destination buffer
+                    sizeof(mName),   // Buffer size
+                    NULL,              // Default char
+                    NULL               // Used default char?
+                );
+                if (result > 0) {
+                    printf("ANSI String: %s\n", mName);
+                } else {
+                    printf("Conversion failed.\n");
+                }
+            } while((strcmp(mName, (char*)import->Name) != 0));
+
+            
+            origThunk++;
+        }
         IT++;
     }
-
+// -------------------------------------------------------------------------------------------------------------
+    // whilepPeb->Ldr->InMemoryOrderModuleList.Flink;
     return 0;
 
 }
