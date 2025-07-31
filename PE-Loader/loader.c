@@ -1,39 +1,70 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
-
+DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics);
 
 void ResolveTLS(BYTE* base) {
+    // Parse DOS and NT headers
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("[!] Invalid DOS header.\n");
+        return;
+    }
 
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("[!] Invalid NT header.\n");
+        return;
+    }
+
+    // Get TLS Directory RVA
     DWORD tlsRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
     if (tlsRVA == 0) {
         printf("[*] No TLS directory present.\n");
         return;
     }
 
-    // Locate TLS directory
+    // Convert RVA to pointer in mapped image
     PIMAGE_TLS_DIRECTORY64 tlsDir = (PIMAGE_TLS_DIRECTORY64)(base + tlsRVA);
 
-    // Get callback array
-    PIMAGE_TLS_CALLBACK* callbacks = (PIMAGE_TLS_CALLBACK*)(tlsDir->AddressOfCallBacks);
-    if (!callbacks) {
-        printf("[*] TLS directory has no callbacks.\n");
+    if (tlsDir->AddressOfCallBacks == 0) {
+        printf("[*] TLS directory present, but no callbacks.\n");
         return;
     }
 
-    // AddressOfCallbacks is a VA, not RVA, so convert it if necessary
-    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)((ULONG_PTR)callbacks);
+    // Convert AddressOfCallBacks (VA) to pointer in manually mapped memory
+    ULONG_PTR imageBaseVA = nt->OptionalHeader.ImageBase;
+    ULONG_PTR imageBaseMapped = (ULONG_PTR)base;
+
+    ULONG_PTR rawCallbackVA = tlsDir->AddressOfCallBacks;
+    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(
+        imageBaseMapped + (rawCallbackVA - imageBaseVA)
+    );
 
     printf("[+] Executing TLS callbacks...\n");
 
-    while (*callbackList) {
-        printf("    -> TLS callback at: 0x%p\n", *callbackList);
-        (*callbackList)((LPVOID)base, DLL_PROCESS_ATTACH, NULL);
-        callbackList++;
-    }
+    int i = 0;
+    while (*callbackList != NULL) {
+        printf("    [%d] TLS callback at: 0x%p\n", i, *callbackList);
 
+        // Optional: validate pointer
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T regionSize = 0x1000; // one page
+        DWORD oldProtect;
+        PVOID callbackAddr = *callbackList;
+
+        if (VirtualQuery(callbackAddr, &mbi, sizeof(mbi))) {
+            if (!(mbi.Protect & PAGE_EXECUTE)) {
+                if (VirtualProtect(callbackAddr, regionSize, PAGE_EXECUTE_READ, &oldProtect)) {
+                    printf("    [+] Temporarily set execute permission on TLS callback.\n");
+                } else {
+                    printf("    [!] Failed to set execute permission. GetLastError: %lu\n", GetLastError());
+                }
+                callbackList++;
+                i++;
+            }
+        }
+    }
     printf("[+] TLS callbacks complete.\n");
 }
 
@@ -380,6 +411,24 @@ const char* functionsToResolve[] = {
 };
 
 #define FUNCTION_COUNT (sizeof(functionsToResolve) / sizeof(functionsToResolve[0]))
+DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics) {
+    if (characteristics & IMAGE_SCN_MEM_EXECUTE) {
+        if (characteristics & IMAGE_SCN_MEM_WRITE)
+            return PAGE_EXECUTE_READWRITE;
+        else if (characteristics & IMAGE_SCN_MEM_READ)
+            return PAGE_EXECUTE_READ;
+        else
+            return PAGE_EXECUTE;
+    } else {
+        if (characteristics & IMAGE_SCN_MEM_WRITE)
+            return PAGE_READWRITE;
+        else if (characteristics & IMAGE_SCN_MEM_READ)
+            return PAGE_READONLY;
+        else
+            return PAGE_NOACCESS;
+    }
+}
+
 void JumpToEntryPoint(BYTE* base) {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
@@ -396,6 +445,7 @@ void JumpToEntryPoint(BYTE* base) {
     ((void(*)())entryPoint)();
 }
 
+void ApplySectionProtections(BYTE* base, pNtProtectVirtualMemory NtProtectVirtualMemory);
 
 int main(int argc, char* argv[]) {
    wchar_t widePath[MAX_PATH];
@@ -539,7 +589,7 @@ int main(int argc, char* argv[]) {
         0,
         &fileSize,
         MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE
+        PAGE_EXECUTE_READWRITE
     );
 
     if (status != 0) {
@@ -688,11 +738,13 @@ int main(int argc, char* argv[]) {
     } else {
         printf("[+] No base relocation needed.");
     }
+    
 // -------------------------------------------------------------------------------------------------------------
     // whilepPeb->Ldr->InMemoryOrderModuleList.Flink;
     ResolveImports((BYTE*)base);
-    ResolveTLS(base);
-    JumpToEntryPoint(base);
+    ApplySectionProtections((BYTE*)base, NtProtectVirtualMemory);
+    ResolveTLS((BYTE*)base);
+    JumpToEntryPoint((BYTE*)base);
 
     return 0;
 
@@ -793,3 +845,39 @@ void InitializeCOMRuntime(BYTE* base) { /* Set up CLR metadata and JIT */ }
 
 // 15. Cleanup - Free temporary allocations and handle errors
 void FinalizeLoading(BYTE* base) { /* Clean up, set loaded flag, return handle */ }
+
+void ApplySectionProtections(BYTE* base,  pNtProtectVirtualMemory NtProtectVirtualMemory) {
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeader);
+
+    // Resolve NtProtectVirtualMemory
+    // pNtProtectVirtualMemory NtProtectVirtualMemory =  (pNtProtectVirtualMemory)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtProtectVirtualMemory");
+
+    // if (!NtProtectVirtualMemory) {
+    //     printf("[-] Failed to resolve NtProtectVirtualMemory\n");
+    //     return;
+    // }
+
+    for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++, section++) {
+        PVOID sectionAddress = base + section->VirtualAddress;
+        SIZE_T sectionSize = section->Misc.VirtualSize;
+        DWORD newProtect = ConvertSectionCharacteristicsToProtection(section->Characteristics);
+        DWORD oldProtect;
+
+        NTSTATUS status = NtProtectVirtualMemory(
+            (HANDLE)-1,
+            &sectionAddress,
+            &sectionSize,
+            newProtect,
+            &oldProtect
+        );
+
+        if (status == 0) {
+            printf("[+] Protection set for section: %s -> 0x%08X\n", section->Name, newProtect);
+        } else {
+            printf("[-] Failed to set protection for section: %s (status: 0x%08X)\n", section->Name, status);
+        }
+    }
+}
+
