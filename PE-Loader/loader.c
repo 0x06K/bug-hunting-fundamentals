@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
+#include <stdint.h>
 DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics);
 
 void ResolveTLS(BYTE* base) {
@@ -446,7 +447,32 @@ void JumpToEntryPoint(BYTE* base) {
 }
 
 void ApplySectionProtections(BYTE* base, pNtProtectVirtualMemory NtProtectVirtualMemory);
+uint8_t* findCRTSection(uint8_t* base) {
+    // Step 1: Read IMAGE_DOS_HEADER
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
 
+    // Step 2: Locate NT Headers
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+    // Step 3: Access Section Headers
+    IMAGE_FILE_HEADER* fileHeader = &nt->FileHeader;
+    IMAGE_OPTIONAL_HEADER* optionalHeader = &nt->OptionalHeader;
+
+    // Section headers come immediately after Optional Header
+    IMAGE_SECTION_HEADER* section = (IMAGE_SECTION_HEADER*)((uint8_t*)optionalHeader + fileHeader->SizeOfOptionalHeader);
+
+    // Step 4: Loop through sections to find .CRT
+    for (int i = 0; i < fileHeader->NumberOfSections; i++) {
+        if (strncmp((char*)section[i].Name, ".CRT", 8) == 0) {
+            // Return pointer to the .CRT section in memory
+            return base + section[i].PointerToRawData;
+        }
+    }
+
+    return NULL; // Not found
+}
 int main(int argc, char* argv[]) {
    wchar_t widePath[MAX_PATH];
     wchar_t finalPath[MAX_PATH];
@@ -744,6 +770,7 @@ int main(int argc, char* argv[]) {
     ResolveImports((BYTE*)base);
     ApplySectionProtections((BYTE*)base, NtProtectVirtualMemory);
     ResolveTLS((BYTE*)base);
+    findCRTSection((BYTE*)base);
     JumpToEntryPoint((BYTE*)base);
 
     return 0;
@@ -879,5 +906,12 @@ void ApplySectionProtections(BYTE* base,  pNtProtectVirtualMemory NtProtectVirtu
             printf("[-] Failed to set protection for section: %s (status: 0x%08X)\n", section->Name, status);
         }
     }
+    uint8_t* crt_section = findCRTSection(base);
+    if (crt_section) {
+        printf(".CRT section found at: %p\n", crt_section);
+    } else {
+        printf(".CRT section not found.\n");
+    }
+
 }
 
