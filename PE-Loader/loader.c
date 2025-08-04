@@ -2,325 +2,11 @@
 #include <winternl.h>
 #include <stdio.h>
 #include <stdint.h>
-DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics);
 
-void ResolveTLS(BYTE* base) {
-    // Parse DOS and NT headers
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        printf("[!] Invalid DOS header.\n");
-        return;
-    }
+// ============================================================================
+// TYPE DEFINITIONS AND FUNCTION POINTERS
+// ============================================================================
 
-    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        printf("[!] Invalid NT header.\n");
-        return;
-    }
-
-    // Get TLS Directory RVA
-    DWORD tlsRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
-    if (tlsRVA == 0) {
-        printf("[*] No TLS directory present.\n");
-        return;
-    }
-
-    // Convert RVA to pointer in mapped image
-    PIMAGE_TLS_DIRECTORY64 tlsDir = (PIMAGE_TLS_DIRECTORY64)(base + tlsRVA);
-
-    if (tlsDir->AddressOfCallBacks == 0) {
-        printf("[*] TLS directory present, but no callbacks.\n");
-        return;
-    }
-
-    // Convert AddressOfCallBacks (VA) to pointer in manually mapped memory
-    ULONG_PTR imageBaseVA = nt->OptionalHeader.ImageBase;
-    ULONG_PTR imageBaseMapped = (ULONG_PTR)base;
-
-    ULONG_PTR rawCallbackVA = tlsDir->AddressOfCallBacks;
-    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(
-        imageBaseMapped + (rawCallbackVA - imageBaseVA)
-    );
-
-    printf("[+] Executing TLS callbacks...\n");
-
-    int i = 0;
-    while (*callbackList != NULL) {
-        printf("    [%d] TLS callback at: 0x%p\n", i, *callbackList);
-
-        // Optional: validate pointer
-        MEMORY_BASIC_INFORMATION mbi;
-        SIZE_T regionSize = 0x1000; // one page
-        DWORD oldProtect;
-        PVOID callbackAddr = *callbackList;
-
-        if (VirtualQuery(callbackAddr, &mbi, sizeof(mbi))) {
-            if (!(mbi.Protect & PAGE_EXECUTE)) {
-                if (VirtualProtect(callbackAddr, regionSize, PAGE_EXECUTE_READ, &oldProtect)) {
-                    printf("    [+] Temporarily set execute permission on TLS callback.\n");
-                } else {
-                    printf("    [!] Failed to set execute permission. GetLastError: %lu\n", GetLastError());
-                }
-                callbackList++;
-                i++;
-            }
-        }
-    }
-    printf("[+] TLS callbacks complete.\n");
-}
-
-void ResolveImports(BYTE* base) {
-    if (!base) {
-        printf("[-] Invalid base address\n");
-        return;
-    }
-
-    // Validate DOS header
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
-    if (IsBadReadPtr(dosHeader, sizeof(IMAGE_DOS_HEADER)) || 
-        dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-        printf("[-] Invalid DOS header\n");
-        return;
-    }
-
-    // Validate NT header offset
-    if (dosHeader->e_lfanew < sizeof(IMAGE_DOS_HEADER) || 
-        dosHeader->e_lfanew > 0x1000) {
-        printf("[-] Invalid NT header offset\n");
-        return;
-    }
-
-    // Validate NT header
-    PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)(base + dosHeader->e_lfanew);
-    if (IsBadReadPtr(ntHeader, sizeof(IMAGE_NT_HEADERS64)) || 
-        ntHeader->Signature != IMAGE_NT_SIGNATURE) {
-        printf("[-] Invalid NT header\n");
-        return;
-    }
-
-    // Get import directory info
-    DWORD importDirRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-    DWORD importDirSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
-    DWORD imageSize = ntHeader->OptionalHeader.SizeOfImage;
-
-    if (!importDirRVA || !importDirSize) {
-        printf("[-] No Import Directory Found\n");
-        return;
-    }
-
-    if (importDirRVA >= imageSize || (importDirRVA + importDirSize) > imageSize) {
-        printf("[-] Invalid import directory RVA or size\n");
-        return;
-    }
-
-    printf("[+] Starting import resolution...\n");
-    printf("[+] Image size: 0x%X, Import dir RVA: 0x%X, Size: 0x%X\n", 
-           imageSize, importDirRVA, importDirSize);
-
-    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(base + importDirRVA);
-    DWORD maxImportDescs = importDirSize / sizeof(IMAGE_IMPORT_DESCRIPTOR);
-    DWORD currentImportDesc = 0;
-
-    // Main import descriptor loop
-    while (importDesc && 
-           currentImportDesc < maxImportDescs &&
-           (BYTE*)importDesc >= base && 
-           (BYTE*)importDesc < (base + imageSize) &&
-           importDesc->Name) {
-        
-        printf("[+] Processing import descriptor %d\n", currentImportDesc);
-
-        // Validate DLL name RVA
-        if (importDesc->Name >= imageSize) {
-            printf("[-] Invalid DLL name RVA: 0x%X\n", importDesc->Name);
-            importDesc++;
-            currentImportDesc++;
-            continue;
-        }
-
-        char* dllName = (char*)(base + importDesc->Name);
-        
-        // Validate DLL name string
-        if (IsBadStringPtrA(dllName, MAX_PATH)) {
-            printf("[-] Invalid DLL name string\n");
-            importDesc++;
-            currentImportDesc++;
-            continue;
-        }
-
-        printf("[+] Processing DLL: %s\n", dllName);
-
-        HMODULE hMod = NULL;
-        BOOL found = FALSE;
-
-        // Try to find module in current process first (via PEB)
-        PPEB pPeb = (PPEB)__readgsqword(0x60);
-        
-        if (!IsBadReadPtr(pPeb, sizeof(PEB)) && pPeb && 
-            !IsBadReadPtr(pPeb->Ldr, sizeof(PEB_LDR_DATA)) && pPeb->Ldr && 
-            !IsBadReadPtr(&pPeb->Ldr->InMemoryOrderModuleList, sizeof(LIST_ENTRY)) &&
-            pPeb->Ldr->InMemoryOrderModuleList.Flink) {
-            
-            PLIST_ENTRY head = &pPeb->Ldr->InMemoryOrderModuleList;
-            PLIST_ENTRY current = head->Flink;
-            int moduleCount = 0;
-            const int MAX_MODULES = 1000;
-            
-            while (current && 
-                   current != head && 
-                   moduleCount < MAX_MODULES &&
-                   !IsBadReadPtr(current, sizeof(LIST_ENTRY))) {
-                
-                PLDR_DATA_TABLE_ENTRY entry = (PLDR_DATA_TABLE_ENTRY)
-                    ((BYTE*)current - 0x10);
-                
-                if (!IsBadReadPtr(entry, sizeof(LDR_DATA_TABLE_ENTRY)) &&
-                    entry->FullDllName.Buffer &&
-                    entry->FullDllName.Length > 0 &&
-                    entry->FullDllName.Length < MAX_PATH * sizeof(WCHAR) &&
-                    !IsBadReadPtr(entry->FullDllName.Buffer, entry->FullDllName.Length)) {
-                    
-                    char modName[MAX_PATH] = {0};
-                    int result = WideCharToMultiByte(CP_ACP, 0, 
-                                                   entry->FullDllName.Buffer, 
-                                                   entry->FullDllName.Length / sizeof(WCHAR),
-                                                   modName, sizeof(modName) - 1, 
-                                                   NULL, NULL);
-                    
-                    if (result > 0) {
-                        // Extract filename from full path
-                        char* fileName = strrchr(modName, '\\');
-                        fileName = fileName ? (fileName + 1) : modName;
-                        
-                        // Case-insensitive comparison
-                        if (lstrcmpiA(fileName, dllName) == 0) {
-                            hMod = (HMODULE)entry->DllBase;
-                            found = TRUE;
-                            printf("[+] Found %s already loaded at 0x%p\n", dllName, hMod);
-                            break;
-                        }
-                    }
-                }
-                
-                current = current->Flink;
-                moduleCount++;
-            }
-            
-            if (moduleCount >= MAX_MODULES) {
-                printf("[-] Warning: Module enumeration limit reached\n");
-            }
-        } else {
-            printf("[-] Cannot access PEB safely, falling back to LoadLibrary\n");
-        }
-
-        // If not found in PEB, try to load it
-        if (!found) {
-            printf("[+] Loading %s...\n", dllName);
-            hMod = LoadLibraryA(dllName);
-            if (!hMod) {
-                DWORD error = GetLastError();
-                printf("[-] Failed to load DLL: %s (Error: %d)\n", dllName, error);
-                importDesc++;
-                currentImportDesc++;
-                continue;
-            }
-            printf("[+] Loaded %s at 0x%p\n", dllName, hMod);
-        }
-
-        // Resolve function imports
-        DWORD origThunkRVA = importDesc->OriginalFirstThunk ? 
-                            importDesc->OriginalFirstThunk : importDesc->FirstThunk;
-        DWORD firstThunkRVA = importDesc->FirstThunk;
-
-        // Validate thunk RVAs
-        if (origThunkRVA >= imageSize || firstThunkRVA >= imageSize) {
-            printf("[-] Invalid thunk RVAs for %s\n", dllName);
-            importDesc++;
-            currentImportDesc++;
-            continue;
-        }
-
-        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)(base + origThunkRVA);
-        PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)(base + firstThunkRVA);
-        DWORD thunkCount = 0;
-        const DWORD MAX_THUNKS = 10000;
-
-        // Import thunk resolution loop
-        while (thunkCount < MAX_THUNKS &&
-               (BYTE*)origThunk >= base && 
-               (BYTE*)origThunk < (base + imageSize) &&
-               (BYTE*)firstThunk >= base && 
-               (BYTE*)firstThunk < (base + imageSize) &&
-               !IsBadReadPtr(origThunk, sizeof(IMAGE_THUNK_DATA)) &&
-               !IsBadReadPtr(firstThunk, sizeof(IMAGE_THUNK_DATA)) &&
-               origThunk->u1.AddressOfData) {
-
-            FARPROC procAddr = NULL;
-            char functionName[256] = {0};
-
-            // Check if import is by ordinal
-#ifdef _WIN64
-            BOOL isOrdinal = (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
-#else
-            BOOL isOrdinal = (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) != 0;
-#endif
-
-            if (isOrdinal) {
-                WORD ordinal = IMAGE_ORDINAL(origThunk->u1.Ordinal);
-                procAddr = GetProcAddress(hMod, (LPCSTR)(uintptr_t)ordinal);
-                _snprintf_s(functionName, sizeof(functionName), _TRUNCATE, "Ordinal#%d", ordinal);
-            } else {
-                // Validate import name RVA
-                if (origThunk->u1.AddressOfData >= imageSize) {
-                    printf("[-] Invalid import name RVA: 0x%llX\n", origThunk->u1.AddressOfData);
-                    break;
-                }
-
-                PIMAGE_IMPORT_BY_NAME import = (PIMAGE_IMPORT_BY_NAME)(base + origThunk->u1.AddressOfData);
-                
-                if (IsBadReadPtr(import, sizeof(IMAGE_IMPORT_BY_NAME)) ||
-                    IsBadStringPtrA(import->Name, 256)) {
-                    printf("[-] Invalid import name structure\n");
-                    break;
-                }
-
-                strncpy_s(functionName, sizeof(functionName), import->Name, _TRUNCATE);
-                procAddr = GetProcAddress(hMod, import->Name);
-            }
-
-            if (!procAddr) {
-                DWORD error = GetLastError();
-                printf("[-] Failed to resolve %s from %s (Error: %d)\n", 
-                       functionName, dllName, error);
-            } else {
-                firstThunk->u1.Function = (uintptr_t)procAddr;
-                printf("[+] Resolved %s from %s -> 0x%p\n", 
-                       functionName, dllName, procAddr);
-            }
-
-            origThunk++;
-            firstThunk++;
-            thunkCount++;
-        }
-
-        if (thunkCount >= MAX_THUNKS) {
-            printf("[-] Warning: Thunk processing limit reached for %s\n", dllName);
-        }
-
-        printf("[+] Completed processing %s (%d functions)\n", dllName, thunkCount);
-        
-        importDesc++;
-        currentImportDesc++;
-    }
-
-    if (currentImportDesc >= maxImportDescs) {
-        printf("[-] Warning: Import descriptor limit reached\n");
-    }
-
-    printf("[+] Import resolving complete. Processed %d DLLs.\n", currentImportDesc);
-}
-
-// Function pointer typedefs for all resolved functions
 typedef NTSTATUS (WINAPI *pNtCreateFile)(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,
@@ -398,7 +84,11 @@ typedef VOID (WINAPI *pRtlZeroMemory)(
     SIZE_T Length
 );
 
-const char* functionsToResolve[] = {
+// ============================================================================
+// GLOBAL CONSTANTS AND VARIABLES
+// ============================================================================
+
+const char* g_functionsToResolve[] = {
     "NtCreateFile",
     "NtReadFile", 
     "NtClose",
@@ -411,7 +101,17 @@ const char* functionsToResolve[] = {
     "RtlZeroMemory"
 };
 
-#define FUNCTION_COUNT (sizeof(functionsToResolve) / sizeof(functionsToResolve[0]))
+#define FUNCTION_COUNT (sizeof(g_functionsToResolve) / sizeof(g_functionsToResolve[0]))
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Converts PE section characteristics to memory protection flags
+ * @param characteristics Section characteristics from PE header
+ * @return Corresponding PAGE_* protection constant
+ */
 DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics) {
     if (characteristics & IMAGE_SCN_MEM_EXECUTE) {
         if (characteristics & IMAGE_SCN_MEM_WRITE)
@@ -430,91 +130,109 @@ DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics) {
     }
 }
 
-void JumpToEntryPoint(BYTE* base) {
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
-
-    DWORD entryRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-    void* entryPoint = (void*)(base + entryRVA);
-
-    printf("[+] Entry Point Address: 0x%p\n", entryPoint);
-
-    // Optional: Create thread if you don't want to block
-    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)entryPoint, NULL, 0, NULL);
-
-    // Direct call (you take over execution)
-    ((void(*)())entryPoint)();
-}
-
-void ApplySectionProtections(BYTE* base, pNtProtectVirtualMemory NtProtectVirtualMemory);
-uint8_t* findCRTSection(uint8_t* base) {
-    // Step 1: Read IMAGE_DOS_HEADER
+/**
+ * @brief Finds the .CRT section in a loaded PE image
+ * @param base Base address of the loaded PE image
+ * @return Pointer to .CRT section or NULL if not found
+ */
+uint8_t* FindCRTSection(uint8_t* base) {
+    // Validate DOS header
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) 
+        return NULL;
 
-    // Step 2: Locate NT Headers
+    // Locate NT headers
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) 
+        return NULL;
 
-    // Step 3: Access Section Headers
+    // Access file and optional headers
     IMAGE_FILE_HEADER* fileHeader = &nt->FileHeader;
     IMAGE_OPTIONAL_HEADER* optionalHeader = &nt->OptionalHeader;
 
-    // Section headers come immediately after Optional Header
+    // Section headers follow the optional header
     IMAGE_SECTION_HEADER* section = (IMAGE_SECTION_HEADER*)((uint8_t*)optionalHeader + fileHeader->SizeOfOptionalHeader);
 
-    // Step 4: Loop through sections to find .CRT
+    // Search for .CRT section
     for (int i = 0; i < fileHeader->NumberOfSections; i++) {
         if (strncmp((char*)section[i].Name, ".CRT", 8) == 0) {
-            // Return pointer to the .CRT section in memory
             return base + section[i].PointerToRawData;
         }
     }
 
-    return NULL; // Not found
+    return NULL; // Section not found
 }
-int main(int argc, char* argv[]) {
-   wchar_t widePath[MAX_PATH];
-    wchar_t finalPath[MAX_PATH];
 
-    if (argc < 2) {
-        printf("Usage: %s <file_path>\n", argv[0]);
-        return -1;
-    } else {
-        MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, widePath, MAX_PATH);
-        printf("[DEBUG] Converted path: %ls\n", widePath);
-
-        swprintf(finalPath, MAX_PATH, L"\\??\\%ls", widePath);
-        wprintf(L"[DEBUG] Final path: %ls\n", finalPath);  // ← FIXED HERE
+/**
+ * @brief Validates PE DOS and NT headers
+ * @param base Base address of PE image
+ * @return TRUE if headers are valid, FALSE otherwise
+ */
+BOOL ValidatePEHeaders(BYTE* base) {
+    // Validate DOS header
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("[-] Invalid DOS signature\n");
+        return FALSE;
     }
 
+    // Validate NT header
+    PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)((BYTE*)base + dosHeader->e_lfanew);
+    if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
+        printf("[-] Invalid NT signature\n");
+        return FALSE;
+    }
 
-    // Get PEB and resolve NTDLL base
+    return TRUE;
+}
+
+// ============================================================================
+// NTDLL FUNCTION RESOLUTION
+// ============================================================================
+
+/**
+ * @brief Gets NTDLL base address from PEB
+ * @return Base address of NTDLL module
+ */
+PVOID GetNTDLLBase() {
     PPEB pPeb = (PPEB)__readgsqword(0x60);
     PLDR_DATA_TABLE_ENTRY pEntry = 
         (PLDR_DATA_TABLE_ENTRY)((BYTE*)pPeb->Ldr->InMemoryOrderModuleList.Flink->Flink - 0x10);
-    PVOID ntdllBase = pEntry->DllBase;
+    return pEntry->DllBase;
+}
 
-    // Parse PE headers and get export directory
+/**
+ * @brief Resolves NTDLL functions by parsing export table manually
+ * @param resolvedFuncs Array to store resolved function addresses
+ * @return TRUE if all functions resolved successfully, FALSE otherwise
+ */
+BOOL ResolveNTDLLFunctions(FARPROC resolvedFuncs[FUNCTION_COUNT]) {
+    // Get NTDLL base address
+    PVOID ntdllBase = GetNTDLLBase();
+
+    // Parse PE headers
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)ntdllBase;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((BYTE*)ntdllBase + dos->e_lfanew);
+    
+    // Get export directory
     IMAGE_DATA_DIRECTORY exportDirData = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)ntdllBase + exportDirData.VirtualAddress);
-
-    // Arrays to store resolved function addresses
-    FARPROC resolvedFuncs[FUNCTION_COUNT] = {0};
 
     // Get export table arrays
     DWORD* nameRVAs = (DWORD*)((BYTE*)ntdllBase + exportDir->AddressOfNames);
     WORD* ordinals  = (WORD*)((BYTE*)ntdllBase + exportDir->AddressOfNameOrdinals);
     DWORD* funcRVAs = (DWORD*)((BYTE*)ntdllBase + exportDir->AddressOfFunctions);
 
-    // Resolve all functions
+    // Initialize resolved functions array
+    memset(resolvedFuncs, 0, sizeof(FARPROC) * FUNCTION_COUNT);
+
+    // Resolve all required functions
     for (int i = 0; i < exportDir->NumberOfNames; i++) {
         const char* functionName = (const char*)ntdllBase + nameRVAs[i];
 
+        // Check if this function is in our required list
         for (int j = 0; j < FUNCTION_COUNT; j++) {
-            if (strcmp(functionName, functionsToResolve[j]) == 0) {
+            if (strcmp(functionName, g_functionsToResolve[j]) == 0) {
                 WORD ordinal = ordinals[i];
                 DWORD funcRVA = funcRVAs[ordinal];
                 resolvedFuncs[j] = (FARPROC)((BYTE*)ntdllBase + funcRVA);
@@ -524,50 +242,65 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // === MANUAL CASTING OF RESOLVED FUNCTIONS ===
-    
-    // Cast each resolved function to its proper type
-    pNtCreateFile NtCreateFile = (pNtCreateFile)resolvedFuncs[0];
-    pNtReadFile NtReadFile = (pNtReadFile)resolvedFuncs[1];
-    pNtClose NtClose = (pNtClose)resolvedFuncs[2];
-    pNtAllocateVirtualMemory NtAllocateVirtualMemory = (pNtAllocateVirtualMemory)resolvedFuncs[3];
-    pNtProtectVirtualMemory NtProtectVirtualMemory = (pNtProtectVirtualMemory)resolvedFuncs[4];
-    pNtQueryInformationFile NtQueryInformationFile = (pNtQueryInformationFile)resolvedFuncs[5];
-    pNtFlushInstructionCache NtFlushInstructionCache = (pNtFlushInstructionCache)resolvedFuncs[6];
-    pRtlAllocateHeap RtlAllocateHeap = (pRtlAllocateHeap)resolvedFuncs[7];
-    pRtlInitUnicodeString RtlInitUnicodeString = (pRtlInitUnicodeString)resolvedFuncs[8];
-    pRtlZeroMemory RtlZeroMemory = (pRtlZeroMemory)resolvedFuncs[9];
-
-    // Verify functions were resolved
-    if (!NtCreateFile || !NtReadFile || !NtClose || !NtAllocateVirtualMemory || 
-        !NtQueryInformationFile || !RtlInitUnicodeString) {
-        printf("[-] Failed to resolve required functions\n");
-        return -1;
+    // Verify all functions were resolved
+    for (int i = 0; i < FUNCTION_COUNT; i++) {
+        if (!resolvedFuncs[i]) {
+            printf("[-] Failed to resolve %s\n", g_functionsToResolve[i]);
+            return FALSE;
+        }
     }
 
-    // === NOW USE THE CAST FUNCTIONS ===
+    return TRUE;
+}
 
-    // Initialize UNICODE_STRING using resolved RtlInitUnicodeString
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+/**
+ * @brief Prepares file path for NTDLL functions
+ * @param inputPath Input file path from command line
+ * @param finalPath Output buffer for formatted path
+ * @return TRUE if path prepared successfully, FALSE otherwise
+ */
+BOOL PrepareFilePath(const char* inputPath, wchar_t* finalPath) {
+    wchar_t widePath[MAX_PATH];
+
+    // Convert to wide char
+    MultiByteToWideChar(CP_UTF8, 0, inputPath, -1, widePath, MAX_PATH);
+    printf("[DEBUG] Converted path: %ls\n", widePath);
+
+    // Format for NTDLL functions
+    swprintf(finalPath, MAX_PATH, L"\\??\\%ls", widePath);
+    wprintf(L"[DEBUG] Final path: %ls\n", finalPath);
+
+    return TRUE;
+}
+
+/**
+ * @brief Opens file using NtCreateFile
+ * @param NtCreateFile Resolved NtCreateFile function pointer
+ * @param RtlInitUnicodeString Resolved RtlInitUnicodeString function pointer
+ * @param filePath Path to file
+ * @param hFile Output file handle
+ * @return TRUE if file opened successfully, FALSE otherwise
+ */
+BOOL OpenFileWithNtAPI(pNtCreateFile NtCreateFile, pRtlInitUnicodeString RtlInitUnicodeString, 
+                       const wchar_t* filePath, HANDLE* hFile) {
+    // Initialize UNICODE_STRING
     UNICODE_STRING uPath;
-    RtlInitUnicodeString(&uPath, finalPath);
+    RtlInitUnicodeString(&uPath, filePath);
 
     // Setup object attributes
     OBJECT_ATTRIBUTES objAttr;
-    InitializeObjectAttributes(
-        &objAttr,
-        &uPath,
-        OBJ_CASE_INSENSITIVE,
-        NULL,
-        NULL
-    );
+    InitializeObjectAttributes(&objAttr, &uPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    // Setup IO_STATUS_BLOCK
+    // Setup IO status block
     IO_STATUS_BLOCK ioStatus;
-    HANDLE hFile;
 
-    // Call NtCreateFile using our resolved function
+    // Open file
     NTSTATUS status = NtCreateFile(
-        &hFile,
+        hFile,
         GENERIC_READ | SYNCHRONIZE,
         &objAttr,
         &ioStatus,
@@ -582,15 +315,25 @@ int main(int argc, char* argv[]) {
 
     if (status != 0) {
         printf("[-] NtCreateFile failed with status: 0x%08X\n", status);
-        return -1;
+        return FALSE;
     }
-    printf("[+] File opened successfully\n");
 
-    // Get file size using resolved NtQueryInformationFile
+    printf("[+] File opened successfully\n");
+    return TRUE;
+}
+
+/**
+ * @brief Gets file size using NtQueryInformationFile
+ * @param NtQueryInformationFile Resolved function pointer
+ * @param hFile File handle
+ * @param fileSize Output file size
+ * @return TRUE if successful, FALSE otherwise
+ */
+BOOL GetFileSizeNt(pNtQueryInformationFile NtQueryInformationFile, HANDLE hFile, SIZE_T* fileSize) {
     FILE_STANDARD_INFORMATION fileInfo;
     IO_STATUS_BLOCK queryIoStatus;
 
-    status = NtQueryInformationFile(
+    NTSTATUS status = NtQueryInformationFile(
         hFile,
         &queryIoStatus,
         &fileInfo,
@@ -600,39 +343,32 @@ int main(int argc, char* argv[]) {
 
     if (status != 0) {
         printf("[-] NtQueryInformationFile failed with status: 0x%08X\n", status);
-        NtClose(hFile);
-        return -1;
+        return FALSE;
     }
 
-    SIZE_T fileSize = fileInfo.EndOfFile.LowPart;
-    printf("[+] File size: %zu bytes\n", fileSize);
+    *fileSize = fileInfo.EndOfFile.LowPart;
+    printf("[+] File size: %zu bytes\n", *fileSize);
+    return TRUE;
+}
 
-    // Allocate memory using resolved NtAllocateVirtualMemory
-    PVOID fileBuffer = NULL;
-    status = NtAllocateVirtualMemory(
-        (HANDLE)-1,
-        &fileBuffer,
-        0,
-        &fileSize,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE
-    );
-
-    if (status != 0) {
-        printf("[-] NtAllocateVirtualMemory failed with status: 0x%08X\n", status);
-        return -1;
-    }
-    printf("[+] Allocated %zu bytes at 0x%p\n", fileSize, fileBuffer);
-
-    // Read file using resolved NtReadFile
+/**
+ * @brief Reads file content using NtReadFile
+ * @param NtReadFile Resolved function pointer
+ * @param hFile File handle
+ * @param buffer Buffer to read into
+ * @param fileSize Size to read
+ * @return TRUE if successful, FALSE otherwise
+ */
+BOOL ReadFileContent(pNtReadFile NtReadFile, HANDLE hFile, PVOID buffer, SIZE_T fileSize) {
     IO_STATUS_BLOCK readIoStatus;
-    status = NtReadFile(
+    
+    NTSTATUS status = NtReadFile(
         hFile,
         NULL,
         NULL,
         NULL,
         &readIoStatus,
-        fileBuffer,
+        buffer,
         (ULONG)fileSize,
         NULL,
         NULL
@@ -640,251 +376,529 @@ int main(int argc, char* argv[]) {
 
     if (status != 0) {
         printf("[-] NtReadFile failed with status: 0x%08X\n", status);
-        // Clean up using resolved NtClose
-        NtClose(hFile);
-        return -1;
-    } else {
-        printf("[+] Successfully read %lu bytes from file\n", readIoStatus.Information);
-        // Display first few bytes as hex
-        printf("[+] First 16 bytes: ");
-        unsigned char* buffer = (unsigned char*)fileBuffer;
-        for (int i = 0; i < 16 && i < fileSize; i++) {
-            printf("%02X ", buffer[i]);
-        }
-        printf("\n");
+        return FALSE;
     }
-    // Clean up using resolved NtClose
-    NtClose(hFile);
-    printf("[+] File closed successfully\n");
+
+    printf("[+] Successfully read %lu bytes from file\n", readIoStatus.Information);
     
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)fileBuffer;
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-        printf("[-] Invalid DOS signature\n");
-        return -1;
+    // Display first few bytes as hex for verification
+    printf("[+] First 16 bytes: ");
+    unsigned char* byteBuffer = (unsigned char*)buffer;
+    for (int i = 0; i < 16 && i < fileSize; i++) {
+        printf("%02X ", byteBuffer[i]);
     }
+    printf("\n");
+
+    return TRUE;
+}
+
+// ============================================================================
+// PE LOADING FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Allocates memory for PE image and copies sections
+ * @param NtAllocateVirtualMemory Resolved function pointer
+ * @param fileBuffer Raw file content
+ * @param base Output base address
+ * @return TRUE if successful, FALSE otherwise
+ */
+BOOL AllocateAndMapSections(pNtAllocateVirtualMemory NtAllocateVirtualMemory, 
+                           PVOID fileBuffer, PVOID* base) {
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)fileBuffer;
     PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)((BYTE*)fileBuffer + dosHeader->e_lfanew);
 
-    if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
-        printf("[-] Invalid NT signature\n");
-        return -1;
-    }
-    PVOID base = NULL;
-    SIZE_T size = ntHeader->OptionalHeader.SizeOfImage;
+    // Allocate memory for the image
+    PVOID imageBase = NULL;
+    SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
 
-    NtAllocateVirtualMemory(
+    NTSTATUS status = NtAllocateVirtualMemory(
         (HANDLE)-1,
-        &base,
+        &imageBase,
         0,
-        &size,
+        &imageSize,
         MEM_RESERVE | MEM_COMMIT,
         PAGE_READWRITE
     );
+
+    if (status != 0) {
+        printf("[-] Failed to allocate memory for PE image\n");
+        return FALSE;
+    }
+
+    printf("[+] Allocated %zu bytes at 0x%p for PE image\n", imageSize, imageBase);
+
+    // Copy headers
     SIZE_T sizeOfHeaders = ntHeader->OptionalHeader.SizeOfHeaders;
-    memcpy(base, fileBuffer, sizeOfHeaders);
-    IMAGE_DOS_HEADER* basedosHeader = (IMAGE_DOS_HEADER*)base;
-    IMAGE_NT_HEADERS* ntBaseHeader = (IMAGE_NT_HEADERS*)((BYTE*)base + dosHeader->e_lfanew);
+    memcpy(imageBase, fileBuffer, sizeOfHeaders);
+
+    // Copy sections
+    IMAGE_NT_HEADERS* ntBaseHeader = (IMAGE_NT_HEADERS*)((BYTE*)imageBase + dosHeader->e_lfanew);
     IMAGE_SECTION_HEADER* sectionHeader = IMAGE_FIRST_SECTION(ntBaseHeader);
 
-    for (int i = 0; i < ntBaseHeader->FileHeader.NumberOfSections; i++, sectionHeader++)
-        memcpy((BYTE*)base + sectionHeader->VirtualAddress,
-       (BYTE*)fileBuffer + sectionHeader->PointerToRawData,
-       sectionHeader->SizeOfRawData);
-    if (ntBaseHeader->OptionalHeader.ImageBase != (DWORD_PTR)base){
-        printf("[-] Base(%p) Relocation needed.\n",base);
-        ptrdiff_t delta = (BYTE*)base - (BYTE*)(ntBaseHeader->OptionalHeader.ImageBase);
-        DWORD relocRVA = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-        DWORD relocSize = ntBaseHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-        IMAGE_BASE_RELOCATION* relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
-        
-        while(relocSize > 0){
-            printf("[+] Size of Block: %d\n",relocSize);
-            WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
-            int entryCount = (relocBase->SizeOfBlock-8)/2;
-            for(DWORD i = 0; i < entryCount; i++) {
-                WORD entry = relocEntries[i];  // Get the i-th entry
-                WORD type = (entry >> 12) & 0xF;
-                WORD offset = entry & 0xFFF;
-                // we need to add base because these offsets are not relative to .reloc section but base.
-                    switch(type){
-                        case IMAGE_REL_BASED_ABSOLUTE: 
-                            // No relocation needed
-                            break;
-                        case IMAGE_REL_BASED_HIGH:
-                            // High 16 bits of 32-bit address
-                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += HIWORD(delta);
-                            break;
-                        case IMAGE_REL_BASED_LOW:
-                            // Low 16 bits of 32-bit address  
-                            *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += LOWORD(delta);
-                            break;
-                        case IMAGE_REL_BASED_HIGHLOW:
-                            // Full 32-bit address
-                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                            break;
-                        case IMAGE_REL_BASED_HIGHADJ:
-                            // 32-bit high-adjusted
-                            {
-                                WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8);
-                                WORD highPart = *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset);
-                                WORD lowPart = relocEntries[++i] & 0xFFFF;
-                                DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
-                                *(WORD*)((BYTE*)base + relocBase->VirtualAddress + offset) = HIWORD(fullAddr);
-                            }
-                            break;
-                        case IMAGE_REL_BASED_MIPS_JMPADDR:
-                            // MIPS/ARM 32-bit
-                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                            break;
-                        case 6:
-                            // Your observed type 6
-                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                            break;
-                        case IMAGE_REL_BASED_THUMB_MOV32:
-                            // ARM Thumb MOV32
-                            *(DWORD*)((BYTE*)base + relocBase->VirtualAddress + offset) += (DWORD)delta;
-                            break;
-                        case IMAGE_REL_BASED_MIPS_JMPADDR16:
-                            // MIPS16 or IA64 64-bit
-                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                            break;
-                        case IMAGE_REL_BASED_DIR64:
-                            // 64-bit address
-                            *(ULONGLONG*)((BYTE*)base + relocBase->VirtualAddress + offset) += delta;
-                            break;
-                        default:
-                            printf("[-] Unsupported relocation type: %d\n", type);
-                            return -1;
-                    }
-                }
-                relocSize -= relocBase->SizeOfBlock;
-                if(!relocSize) break;
-                relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
-            }
-            printf("[+] Relocations Applied.\n");
-    } else {
-        printf("[+] No base relocation needed.");
+    for (int i = 0; i < ntBaseHeader->FileHeader.NumberOfSections; i++, sectionHeader++) {
+        memcpy((BYTE*)imageBase + sectionHeader->VirtualAddress,
+               (BYTE*)fileBuffer + sectionHeader->PointerToRawData,
+               sectionHeader->SizeOfRawData);
+        printf("[+] Copied section %s to RVA 0x%08X\n", sectionHeader->Name, sectionHeader->VirtualAddress);
     }
-    
-// -------------------------------------------------------------------------------------------------------------
-    // whilepPeb->Ldr->InMemoryOrderModuleList.Flink;
-    ResolveImports((BYTE*)base);
-    ApplySectionProtections((BYTE*)base, NtProtectVirtualMemory);
-    ResolveTLS((BYTE*)base);
-    findCRTSection((BYTE*)base);
-    JumpToEntryPoint((BYTE*)base);
 
-    return 0;
-
+    *base = imageBase;
+    return TRUE;
 }
-/*
 
-User clicks → Explorer → ShellExecute → CreateProcess → NtCreateUserProcess →
-    ↳ Object Manager opens file
-    ↳ PE image mapped via section
-    ↳ Kernel parses PE headers
-    ↳ Thread, memory, and stack created
-    ↳ Transition to user-mode stub in NTDLL
-        ↳ Loads DLLs via LdrLoadDll
-        ↳ Resolves imports
-        ↳ Calls entry point
+/**
+ * @brief Processes base relocations for PE image
+ * @param base Base address of loaded PE image
+ * @return TRUE if successful, FALSE otherwise
+ */
+BOOL ProcessBaseRelocations(BYTE* base) {
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
 
+    // Check if relocation is needed
+    if (ntHeader->OptionalHeader.ImageBase == (DWORD_PTR)base) {
+        printf("[+] No base relocation needed\n");
+        return TRUE;
+    }
 
-PE file reading → NtCreateFile() + NtReadFile() for target executable
-PE header validation → DOS/NT headers and signature checks
-Image memory allocation → NtAllocateVirtualMemory() at preferred base
-Section mapping → Copy PE sections to virtual addresses
-Import resolution → Load DLLs and resolve function addresses
-Relocation processing → Fix addresses if base changed
-Memory protection → NtProtectVirtualMemory() for section permissions
-TLS initialization → Thread Local Storage callbacks
-DLL entry points → DllMain() calls in dependency order
-Thread scheduling → Add to scheduler ready queue
-Context switch → Jump to executable entry point
-Program execution → Your main() function runs
+    printf("[+] Base relocation needed (loaded at 0x%p, preferred 0x%llX)\n", 
+           base, ntHeader->OptionalHeader.ImageBase);
 
-Result: Your program runs exactly as if Windows loaded it, but you control every step of the process.
+    // Calculate delta
+    ptrdiff_t delta = (BYTE*)base - (BYTE*)(ntHeader->OptionalHeader.ImageBase);
+    
+    // Get relocation directory
+    DWORD relocRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+    DWORD relocSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    
+    if (relocRVA == 0 || relocSize == 0) {
+        printf("[-] No relocation data available\n");
+        return FALSE;
+    }
 
-FLow is like this {PEB} has member pointer of type PEB_LDR_DATA named
-Ldr which points to -> member of PEB_LDR_DATA InMemoryOrderModuleList of
-type LIST_ENTRY(circullar double linked list) that points to -> a an object
-of PLDR_DATA_TABLE_ENTRY which contains the information of one module it has
-a pointer (LIST_ENTRY InMemoryOrderLinks) it points to other table entries
+    IMAGE_BASE_RELOCATION* relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
+    
+    // Process relocation blocks
+    while (relocSize > 0) {
+        WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
+        int entryCount = (relocBase->SizeOfBlock - 8) / 2;
+        
+        printf("[+] Processing relocation block at RVA 0x%08X (%d entries)\n", 
+               relocBase->VirtualAddress, entryCount);
 
-think of it like you have a main class PEB which contains the pointer 
-of clas PEB_LDR_DATA to store the addr of its object that pointer points 
-to that object and now that object has a member of type LIST_ENTRY which 
-is a circular doubly linked list now this list points to another data structure
-named PEB_LDR_DATA_TABLE_ENTRY which contains information of one module
-it has a pointer (LIST_ENTRY InMemoryOrderLinks) that points to other 
-PLDR_DATA_TABLE_ENTRIES. So in simple terms flow is like this:
+        for (DWORD i = 0; i < entryCount; i++) {
+            WORD entry = relocEntries[i];
+            WORD type = (entry >> 12) & 0xF;
+            WORD offset = entry & 0xFFF;
+            
+            BYTE* relocAddr = base + relocBase->VirtualAddress + offset;
 
-PEB -> PEB_LDR_DATA* -> PEB_LDR_DATA -> LIST_ENTRY(circulardoublylinkedlist).Flink*
--> PLDR_DATA_TABLE_ENTRIES
+            switch (type) {
+                case IMAGE_REL_BASED_ABSOLUTE:
+                    // No relocation needed
+                    break;
+                case IMAGE_REL_BASED_HIGH:
+                    *(WORD*)relocAddr += HIWORD(delta);
+                    break;
+                case IMAGE_REL_BASED_LOW:
+                    *(WORD*)relocAddr += LOWORD(delta);
+                    break;
+                case IMAGE_REL_BASED_HIGHLOW:
+                    *(DWORD*)relocAddr += (DWORD)delta;
+                    break;
+                case IMAGE_REL_BASED_HIGHADJ:
+                    {
+                        WORD highPart = *(WORD*)relocAddr;
+                        WORD lowPart = relocEntries[++i] & 0xFFFF;
+                        DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
+                        *(WORD*)relocAddr = HIWORD(fullAddr);
+                    }
+                    break;
+                case IMAGE_REL_BASED_MIPS_JMPADDR:
+                    *(DWORD*)relocAddr += (DWORD)delta;
+                    break;
+                case 6: // Observed type 6 (likely DIR64 on some systems)
+                case IMAGE_REL_BASED_DIR64:
+                    *(ULONGLONG*)relocAddr += delta;
+                    break;
+                case IMAGE_REL_BASED_THUMB_MOV32:
+                    *(DWORD*)relocAddr += (DWORD)delta;
+                    break;
+                case IMAGE_REL_BASED_MIPS_JMPADDR16:
+                    *(ULONGLONG*)relocAddr += delta;
+                    break;
+                default:
+                    printf("[-] Unsupported relocation type: %d\n", type);
+                    return FALSE;
+            }
+        }
+        
+        relocSize -= relocBase->SizeOfBlock;
+        if (!relocSize) break;
+        relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
+    }
 
-when we perform pointer airthmetic in the end it depends on pointer that how much byte it points to original
-like: (BYTE*)ntdllBase + exportDirData.VirtualAddress will return a pointer to a byte. but int* ptr = &a;ptr++ will give pointer to 
-integer means 4 bytes. (BYTE*)ntdllBase + 0xsomething in the end a pointer to a byte will be returned.
-Here are all the remaining PE loader steps as one-line summaries:
-Complete PE Loader Steps (After Imports + TLS):
-*/
-// 1. Base Relocations - Fix addresses if not loaded at preferred base
-void ProcessRelocations(BYTE* base) { /* Parse relocation table, apply fixups for new base address */ }
+    printf("[+] Base relocations applied successfully\n");
+    return TRUE;
+}
 
-// 2. Memory Protection - Set correct section permissions (RX, RW, etc.)
-void SetSectionProtections(BYTE* base) { /* VirtualProtect each section with proper flags */ }
+/**
+ * @brief Finds module in PEB loader data
+ * @param dllName Name of DLL to find
+ * @param hMod Output module handle
+ * @return TRUE if found, FALSE otherwise
+ */
+BOOL FindModuleInPEB(const char* dllName, HMODULE* hMod) {
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    
+    // Validate PEB access
+    if (!pPeb || IsBadReadPtr(pPeb, sizeof(PEB)) || 
+        !pPeb->Ldr || IsBadReadPtr(pPeb->Ldr, sizeof(PEB_LDR_DATA))) {
+        return FALSE;
+    }
 
-// 3. Exception Directory - Register structured exception handlers
-void RegisterExceptionHandlers(BYTE* base) { /* Add function table entries for x64 SEH */ }
+    PLIST_ENTRY head = &pPeb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY current = head->Flink;
+    int moduleCount = 0;
+    const int MAX_MODULES = 1000;
+    
+    // Walk the module list
+    while (current && current != head && moduleCount < MAX_MODULES &&
+           !IsBadReadPtr(current, sizeof(LIST_ENTRY))) {
+        
+        PLDR_DATA_TABLE_ENTRY entry = (PLDR_DATA_TABLE_ENTRY)((BYTE*)current - 0x10);
+        
+        if (!IsBadReadPtr(entry, sizeof(LDR_DATA_TABLE_ENTRY)) &&
+            entry->FullDllName.Buffer &&
+            entry->FullDllName.Length > 0 &&
+            entry->FullDllName.Length < MAX_PATH * sizeof(WCHAR) &&
+            !IsBadReadPtr(entry->FullDllName.Buffer, entry->FullDllName.Length)) {
+            
+            char modName[MAX_PATH] = {0};
+            int result = WideCharToMultiByte(CP_ACP, 0, 
+                                           entry->FullDllName.Buffer, 
+                                           entry->FullDllName.Length / sizeof(WCHAR),
+                                           modName, sizeof(modName) - 1, 
+                                           NULL, NULL);
+            
+            if (result > 0) {
+                // Extract filename from full path
+                char* fileName = strrchr(modName, '\\');
+                fileName = fileName ? (fileName + 1) : modName;
+                
+                // Case-insensitive comparison
+                if (lstrcmpiA(fileName, dllName) == 0) {
+                    *hMod = (HMODULE)entry->DllBase;
+                    printf("[+] Found %s already loaded at 0x%p\n", dllName, *hMod);
+                    return TRUE;
+                }
+            }
+        }
+        
+        current = current->Flink;
+        moduleCount++;
+    }
 
-// 4. Security Cookie - Initialize stack canary for buffer overflow protection
-void InitializeSecurityCookie(BYTE* base) { /* Set __security_cookie with random value */ }
+    return FALSE;
+}
 
-// 5. DLL Entry Point - Call DllMain with DLL_PROCESS_ATTACH
-BOOL CallDllMain(HMODULE hMod) { /* Execute entry point for module initialization */ }
+/**
+ * @brief Resolves a single function import
+ * @param hMod Module handle
+ * @param import Import information
+ * @param isOrdinal Whether import is by ordinal
+ * @param procAddr Output procedure address
+ * @return TRUE if successful, FALSE otherwise
+ */
+BOOL ResolveSingleImport(HMODULE hMod, PIMAGE_IMPORT_BY_NAME import, BOOL isOrdinal, 
+                        ULONGLONG ordinalValue, FARPROC* procAddr) {
+    char functionName[256] = {0};
 
-// 6. Export Directory - Process exported functions (if module exports APIs)
-void ProcessExports(BYTE* base) { /* Parse export table, set up function forwarding */ }
+    if (isOrdinal) {
+        WORD ordinal = IMAGE_ORDINAL(ordinalValue);
+        *procAddr = GetProcAddress(hMod, (LPCSTR)(uintptr_t)ordinal);
+        _snprintf_s(functionName, sizeof(functionName), _TRUNCATE, "Ordinal#%d", ordinal);
+    } else {
+        if (IsBadReadPtr(import, sizeof(IMAGE_IMPORT_BY_NAME)) ||
+            IsBadStringPtrA(import->Name, 256)) {
+            printf("[-] Invalid import name structure\n");
+            return FALSE;
+        }
 
-// 7. Delay Load Imports - Handle delay-loaded DLLs on first function call
-void SetupDelayImports(BYTE* base) { /* Set up delay import descriptors and thunks */ }
+        strncpy_s(functionName, sizeof(functionName), import->Name, _TRUNCATE);
+        *procAddr = GetProcAddress(hMod, import->Name);
+    }
 
-// 8. Resource Directory - Load embedded resources (icons, strings, etc.)
-void LoadResources(BYTE* base) { /* Parse resource tree, extract data */ }
+    if (!*procAddr) {
+        DWORD error = GetLastError();
+        printf("[-] Failed to resolve %s (Error: %d)\n", functionName, error);
+        return FALSE;
+    }
 
-// 9. Debug Directory - Process debug information and PDB loading
-void ProcessDebugInfo(BYTE* base) { /* Handle debug directories, load symbols */ }
+    printf("[+] Resolved %s -> 0x%p\n", functionName, *procAddr);
+    return TRUE;
+}
 
-// 10. Digital Signature - Verify Authenticode signature validity
-BOOL VerifySignature(BYTE* base) { /* Check certificate chain and signature */ }
+/**
+ * @brief Resolves imports for PE image
+ * @param base Base address of loaded PE image
+ */
+void ResolveImports(BYTE* base) {
+    if (!base) {
+        printf("[-] Invalid base address\n");
+        return;
+    }
 
-// 11. Control Flow Guard - Initialize CFG if enabled
-void InitializeCFG(BYTE* base) { /* Set up CFG bitmap and valid call targets */ }
+    // Validate PE headers
+    if (!ValidatePEHeaders(base)) {
+        return;
+    }
 
-// 12. Load Config - Process load configuration directory
-void ProcessLoadConfig(BYTE* base) { /* Handle GFIDS, CFG, SEH settings */ }
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)(base + dosHeader->e_lfanew);
 
-// 13. Bound Imports - Handle pre-bound import optimization
-void ProcessBoundImports(BYTE* base) { /* Check timestamps, validate bound addresses */ }
+    // Get import directory info
+    DWORD importDirRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    DWORD importDirSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+    DWORD imageSize = ntHeader->OptionalHeader.SizeOfImage;
 
-// 14. COM+ Runtime - Initialize .NET metadata if managed code
-void InitializeCOMRuntime(BYTE* base) { /* Set up CLR metadata and JIT */ }
+    if (!importDirRVA || !importDirSize) {
+        printf("[-] No Import Directory Found\n");
+        return;
+    }
 
-// 15. Cleanup - Free temporary allocations and handle errors
-void FinalizeLoading(BYTE* base) { /* Clean up, set loaded flag, return handle */ }
+    if (importDirRVA >= imageSize || (importDirRVA + importDirSize) > imageSize) {
+        printf("[-] Invalid import directory RVA or size\n");
+        return;
+    }
 
-void ApplySectionProtections(BYTE* base,  pNtProtectVirtualMemory NtProtectVirtualMemory) {
+    printf("[+] Starting import resolution...\n");
+    printf("[+] Image size: 0x%X, Import dir RVA: 0x%X, Size: 0x%X\n", 
+           imageSize, importDirRVA, importDirSize);
+
+    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(base + importDirRVA);
+    DWORD maxImportDescs = importDirSize / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    DWORD currentImportDesc = 0;
+
+    // Process each import descriptor
+    while (importDesc && 
+           currentImportDesc < maxImportDescs &&
+           (BYTE*)importDesc >= base && 
+           (BYTE*)importDesc < (base + imageSize) &&
+           importDesc->Name) {
+        
+        printf("[+] Processing import descriptor %d\n", currentImportDesc);
+
+        // Validate DLL name RVA
+        if (importDesc->Name >= imageSize) {
+            printf("[-] Invalid DLL name RVA: 0x%X\n", importDesc->Name);
+            importDesc++;
+            currentImportDesc++;
+            continue;
+        }
+
+        char* dllName = (char*)(base + importDesc->Name);
+        
+        // Validate DLL name string
+        if (IsBadStringPtrA(dllName, MAX_PATH)) {
+            printf("[-] Invalid DLL name string\n");
+            importDesc++;
+            currentImportDesc++;
+            continue;
+        }
+
+        printf("[+] Processing DLL: %s\n", dllName);
+
+        HMODULE hMod = NULL;
+        BOOL found = FALSE;
+
+        // Try to find module in PEB first
+        found = FindModuleInPEB(dllName, &hMod);
+
+        // If not found in PEB, try to load it
+        if (!found) {
+            printf("[+] Loading %s...\n", dllName);
+            hMod = LoadLibraryA(dllName);
+            if (!hMod) {
+                DWORD error = GetLastError();
+                printf("[-] Failed to load DLL: %s (Error: %d)\n", dllName, error);
+                importDesc++;
+                currentImportDesc++;
+                continue;
+            }
+            printf("[+] Loaded %s at 0x%p\n", dllName, hMod);
+        }
+
+        // Resolve function imports
+        DWORD origThunkRVA = importDesc->OriginalFirstThunk ? 
+                            importDesc->OriginalFirstThunk : importDesc->FirstThunk;
+        DWORD firstThunkRVA = importDesc->FirstThunk;
+
+        // Validate thunk RVAs
+        if (origThunkRVA >= imageSize || firstThunkRVA >= imageSize) {
+            printf("[-] Invalid thunk RVAs for %s\n", dllName);
+            importDesc++;
+            currentImportDesc++;
+            continue;
+        }
+
+        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)(base + origThunkRVA);
+        PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)(base + firstThunkRVA);
+        DWORD thunkCount = 0;
+        const DWORD MAX_THUNKS = 10000;
+
+        // Process each import thunk
+        while (thunkCount < MAX_THUNKS &&
+               (BYTE*)origThunk >= base && 
+               (BYTE*)origThunk < (base + imageSize) &&
+               (BYTE*)firstThunk >= base && 
+               (BYTE*)firstThunk < (base + imageSize) &&
+               !IsBadReadPtr(origThunk, sizeof(IMAGE_THUNK_DATA)) &&
+               !IsBadReadPtr(firstThunk, sizeof(IMAGE_THUNK_DATA)) &&
+               origThunk->u1.AddressOfData) {
+
+            FARPROC procAddr = NULL;
+
+            // Check if import is by ordinal
+#ifdef _WIN64
+            BOOL isOrdinal = (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
+#else
+            BOOL isOrdinal = (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) != 0;
+#endif
+
+            if (isOrdinal) {
+                if (!ResolveSingleImport(hMod, NULL, TRUE, origThunk->u1.Ordinal, &procAddr)) {
+                    break;
+                }
+            } else {
+                // Validate import name RVA
+                if (origThunk->u1.AddressOfData >= imageSize) {
+                    printf("[-] Invalid import name RVA: 0x%llX\n", origThunk->u1.AddressOfData);
+                    break;
+                }
+
+                PIMAGE_IMPORT_BY_NAME import = (PIMAGE_IMPORT_BY_NAME)(base + origThunk->u1.AddressOfData);
+                if (!ResolveSingleImport(hMod, import, FALSE, 0, &procAddr)) {
+                    break;
+                }
+            }
+
+            // Update the import address table
+            if (procAddr) {
+                firstThunk->u1.Function = (uintptr_t)procAddr;
+            }
+
+            origThunk++;
+            firstThunk++;
+            thunkCount++;
+        }
+
+        if (thunkCount >= MAX_THUNKS) {
+            printf("[-] Warning: Thunk processing limit reached for %s\n", dllName);
+        }
+
+        printf("[+] Completed processing %s (%d functions)\n", dllName, thunkCount);
+        
+        importDesc++;
+        currentImportDesc++;
+    }
+
+    if (currentImportDesc >= maxImportDescs) {
+        printf("[-] Warning: Import descriptor limit reached\n");
+    }
+
+    printf("[+] Import resolving complete. Processed %d DLLs.\n", currentImportDesc);
+}
+
+/**
+ * @brief Resolves TLS (Thread Local Storage) callbacks
+ * @param base Base address of loaded PE image
+ */
+void ResolveTLS(BYTE* base) {
+    // Parse DOS and NT headers
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        printf("[!] Invalid DOS header.\n");
+        return;
+    }
+
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        printf("[!] Invalid NT header.\n");
+        return;
+    }
+
+    // Get TLS Directory RVA
+    DWORD tlsRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+    if (tlsRVA == 0) {
+        printf("[*] No TLS directory present.\n");
+        return;
+    }
+
+    // Convert RVA to pointer in mapped image
+    PIMAGE_TLS_DIRECTORY64 tlsDir = (PIMAGE_TLS_DIRECTORY64)(base + tlsRVA);
+
+    if (tlsDir->AddressOfCallBacks == 0) {
+        printf("[*] TLS directory present, but no callbacks.\n");
+        return;
+    }
+
+    // Convert AddressOfCallBacks (VA) to pointer in manually mapped memory
+    ULONG_PTR imageBaseVA = nt->OptionalHeader.ImageBase;
+    ULONG_PTR imageBaseMapped = (ULONG_PTR)base;
+
+    ULONG_PTR rawCallbackVA = tlsDir->AddressOfCallBacks;
+    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(
+        imageBaseMapped + (rawCallbackVA - imageBaseVA)
+    );
+
+    printf("[+] Executing TLS callbacks...\n");
+
+    int i = 0;
+    while (*callbackList != NULL) {
+        printf("    [%d] TLS callback at: 0x%p\n", i, *callbackList);
+
+        // Optional: validate pointer and set execute permission
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T regionSize = 0x1000; // one page
+        DWORD oldProtect;
+        PVOID callbackAddr = *callbackList;
+
+        if (VirtualQuery(callbackAddr, &mbi, sizeof(mbi))) {
+            if (!(mbi.Protect & PAGE_EXECUTE)) {
+                if (VirtualProtect(callbackAddr, regionSize, PAGE_EXECUTE_READ, &oldProtect)) {
+                    printf("    [+] Temporarily set execute permission on TLS callback.\n");
+                } else {
+                    printf("    [!] Failed to set execute permission. GetLastError: %lu\n", GetLastError());
+                }
+            }
+        }
+
+        callbackList++;
+        i++;
+    }
+    printf("[+] TLS callbacks complete.\n");
+}
+
+/**
+ * @brief Applies proper memory protection to PE sections
+ * @param base Base address of loaded PE image
+ * @param NtProtectVirtualMemory Resolved function pointer
+ */
+void ApplySectionProtections(BYTE* base, pNtProtectVirtualMemory NtProtectVirtualMemory) {
+    if (!base || !NtProtectVirtualMemory) {
+        printf("[-] Invalid parameters for section protection\n");
+        return;
+    }
+
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
     PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
     PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeader);
 
-    // Resolve NtProtectVirtualMemory
-    // pNtProtectVirtualMemory NtProtectVirtualMemory =  (pNtProtectVirtualMemory)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtProtectVirtualMemory");
+    printf("[+] Applying section protections...\n");
 
-    // if (!NtProtectVirtualMemory) {
-    //     printf("[-] Failed to resolve NtProtectVirtualMemory\n");
-    //     return;
-    // }
-
+    // Process each section
     for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++, section++) {
         PVOID sectionAddress = base + section->VirtualAddress;
         SIZE_T sectionSize = section->Misc.VirtualSize;
@@ -905,12 +919,226 @@ void ApplySectionProtections(BYTE* base,  pNtProtectVirtualMemory NtProtectVirtu
             printf("[-] Failed to set protection for section: %s (status: 0x%08X)\n", section->Name, status);
         }
     }
-    uint8_t* crt_section = findCRTSection(base);
-    if (crt_section) {
-        printf(".CRT section found at: %p\n", crt_section);
+
+    // Find and log CRT section if present
+    uint8_t* crtSection = FindCRTSection(base);
+    if (crtSection) {
+        printf("[+] .CRT section found at: %p\n", crtSection);
     } else {
-        printf(".CRT section not found.\n");
+        printf("[*] .CRT section not found\n");
     }
 
+    printf("[+] Section protections applied successfully\n");
 }
 
+/**
+ * @brief Jumps to the PE entry point to execute the loaded image
+ * @param base Base address of loaded PE image
+ */
+void JumpToEntryPoint(BYTE* base) {
+    if (!base) {
+        printf("[-] Invalid base address for entry point\n");
+        return;
+    }
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
+
+    DWORD entryRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+    void* entryPoint = (void*)(base + entryRVA);
+
+    printf("[+] Entry Point Address: 0x%p\n", entryPoint);
+
+    // Optional: Create thread if you don't want to block current thread
+    HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)entryPoint, NULL, 0, NULL);
+    if (hThread) {
+        printf("[+] Created new thread for execution\n");
+        CloseHandle(hThread);
+    }
+
+    // Direct call (transfers control to loaded PE)
+    printf("[+] Jumping to entry point...\n");
+    ((void(*)())entryPoint)();
+}
+
+// ============================================================================
+// MAIN FUNCTION
+// ============================================================================
+
+/**
+ * @brief Main function - PE Loader entry point
+ * @param argc Argument count
+ * @param argv Argument values
+ * @return Exit code
+ */
+int main(int argc, char* argv[]) {
+    printf("[+] Manual PE Loader Starting...\n");
+
+    // ========================================================================
+    // ARGUMENT VALIDATION AND PATH PREPARATION
+    // ========================================================================
+
+    if (argc < 2) {
+        printf("Usage: %s <file_path>\n", argv[0]);
+        return -1;
+    }
+
+    wchar_t finalPath[MAX_PATH];
+    if (!PrepareFilePath(argv[1], finalPath)) {
+        printf("[-] Failed to prepare file path\n");
+        return -1;
+    }
+
+    // ========================================================================
+    // NTDLL FUNCTION RESOLUTION
+    // ========================================================================
+
+    printf("[+] Resolving NTDLL functions...\n");
+    FARPROC resolvedFuncs[FUNCTION_COUNT] = {0};
+    
+    if (!ResolveNTDLLFunctions(resolvedFuncs)) {
+        printf("[-] Failed to resolve required NTDLL functions\n");
+        return -1;
+    }
+
+    // Cast resolved functions to proper types
+    pNtCreateFile NtCreateFile = (pNtCreateFile)resolvedFuncs[0];
+    pNtReadFile NtReadFile = (pNtReadFile)resolvedFuncs[1];
+    pNtClose NtClose = (pNtClose)resolvedFuncs[2];
+    pNtAllocateVirtualMemory NtAllocateVirtualMemory = (pNtAllocateVirtualMemory)resolvedFuncs[3];
+    pNtProtectVirtualMemory NtProtectVirtualMemory = (pNtProtectVirtualMemory)resolvedFuncs[4];
+    pNtQueryInformationFile NtQueryInformationFile = (pNtQueryInformationFile)resolvedFuncs[5];
+    pNtFlushInstructionCache NtFlushInstructionCache = (pNtFlushInstructionCache)resolvedFuncs[6];
+    pRtlAllocateHeap RtlAllocateHeap = (pRtlAllocateHeap)resolvedFuncs[7];
+    pRtlInitUnicodeString RtlInitUnicodeString = (pRtlInitUnicodeString)resolvedFuncs[8];
+    pRtlZeroMemory RtlZeroMemory = (pRtlZeroMemory)resolvedFuncs[9];
+
+    // ========================================================================
+    // FILE OPERATIONS
+    // ========================================================================
+
+    printf("[+] Opening target PE file...\n");
+    HANDLE hFile;
+    if (!OpenFileWithNtAPI(NtCreateFile, RtlInitUnicodeString, finalPath, &hFile)) {
+        return -1;
+    }
+
+    // Get file size
+    SIZE_T fileSize;
+    if (!GetFileSizeNt(NtQueryInformationFile, hFile, &fileSize)) {
+        NtClose(hFile);
+        return -1;
+    }
+
+    // Allocate buffer for file content
+    PVOID fileBuffer = NULL;
+    SIZE_T bufferSize = fileSize;
+    NTSTATUS status = NtAllocateVirtualMemory(
+        (HANDLE)-1,
+        &fileBuffer,
+        0,
+        &bufferSize,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE
+    );
+
+    if (status != 0) {
+        printf("[-] Failed to allocate file buffer\n");
+        NtClose(hFile);
+        return -1;
+    }
+    printf("[+] Allocated %zu bytes at 0x%p for file buffer\n", fileSize, fileBuffer);
+
+    // Read file content
+    if (!ReadFileContent(NtReadFile, hFile, fileBuffer, fileSize)) {
+        NtClose(hFile);
+        return -1;
+    }
+
+    // Close file handle
+    NtClose(hFile);
+    printf("[+] File closed successfully\n");
+
+    // ========================================================================
+    // PE VALIDATION AND LOADING
+    // ========================================================================
+
+    printf("[+] Validating PE file...\n");
+    if (!ValidatePEHeaders(fileBuffer)) {
+        return -1;
+    }
+
+    // Allocate memory and map PE sections
+    printf("[+] Mapping PE sections...\n");
+    PVOID peBase = NULL;
+    if (!AllocateAndMapSections(NtAllocateVirtualMemory, fileBuffer, &peBase)) {
+        return -1;
+    }
+
+    // ========================================================================
+    // PE PROCESSING
+    // ========================================================================
+
+    printf("[+] Processing base relocations...\n");
+    if (!ProcessBaseRelocations((BYTE*)peBase)) {
+        printf("[-] Failed to process relocations\n");
+        return -1;
+    }
+
+    printf("[+] Resolving imports...\n");
+    ResolveImports((BYTE*)peBase);
+
+    printf("[+] Applying section protections...\n");
+    ApplySectionProtections((BYTE*)peBase, NtProtectVirtualMemory);
+
+    printf("[+] Processing TLS callbacks...\n");
+    ResolveTLS((BYTE*)peBase);
+
+    // ========================================================================
+    // EXECUTION
+    // ========================================================================
+
+    printf("[+] Starting PE execution...\n");
+    JumpToEntryPoint((BYTE*)peBase);
+
+    printf("[+] PE Loader completed successfully\n");
+    return 0;
+}
+
+// ============================================================================
+// ADDITIONAL HELPER FUNCTIONS (Future Extensions)
+// ============================================================================
+
+/*
+ * Future PE loader enhancements that can be implemented:
+ * 
+ * 1. ProcessExceptionDirectory() - Register SEH handlers
+ * 2. InitializeSecurityCookie() - Set stack canary
+ * 3. ProcessDelayImports() - Handle delay-loaded DLLs
+ * 4. LoadResources() - Extract embedded resources
+ * 5. ProcessDebugInfo() - Load debug symbols
+ * 6. VerifyDigitalSignature() - Check Authenticode
+ * 7. InitializeCFG() - Control Flow Guard setup
+ * 8. ProcessLoadConfig() - Handle load configuration
+ * 9. ProcessBoundImports() - Optimize pre-bound imports
+ * 10. InitializeCOMRuntime() - .NET CLR initialization
+ */
+
+/**
+ * @brief Cleanup function for proper resource management
+ * @param peBase Base address of loaded PE
+ * @param fileBuffer File buffer to free
+ */
+void CleanupResources(PVOID peBase, PVOID fileBuffer) {
+    if (peBase) {
+        // Note: In a real implementation, you might want to keep PE loaded
+        // or properly unload with VirtualFree/NtFreeVirtualMemory
+        printf("[+] PE remains loaded at 0x%p\n", peBase);
+    }
+    
+    if (fileBuffer) {
+        // Note: Original code didn't free file buffer
+        // Keeping same behavior as original
+        printf("[+] File buffer at 0x%p (not freed - same as original)\n", fileBuffer);
+    }
+}
