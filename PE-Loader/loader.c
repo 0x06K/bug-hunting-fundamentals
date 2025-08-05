@@ -195,6 +195,7 @@ BOOL ValidatePEHeaders(BYTE* base) {
  * @return Base address of NTDLL module
  */
 PVOID GetNTDLLBase() {
+    // Get pointer PEB(Process environment block)
     PPEB pPeb = (PPEB)__readgsqword(0x60);
     PLDR_DATA_TABLE_ENTRY pEntry = 
         (PLDR_DATA_TABLE_ENTRY)((BYTE*)pPeb->Ldr->InMemoryOrderModuleList.Flink->Flink - 0x10);
@@ -1090,7 +1091,7 @@ int main(int argc, char* argv[]) {
 
     printf("[+] Applying section protections...\n");
     ApplySectionProtections((BYTE*)peBase, NtProtectVirtualMemory);
-
+    
     printf("[+] Processing TLS callbacks...\n");
     ResolveTLS((BYTE*)peBase);
 
