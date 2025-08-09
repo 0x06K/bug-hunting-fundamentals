@@ -970,6 +970,7 @@ void JumpToEntryPoint(BYTE* base) {
  * @param argv Argument values
  * @return Exit code
  */
+
 int main(int argc, char* argv[]) {
     printf("[+] Manual PE Loader Starting...\n");
 
