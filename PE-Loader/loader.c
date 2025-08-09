@@ -135,32 +135,38 @@ DWORD ConvertSectionCharacteristicsToProtection(DWORD characteristics) {
  * @param base Base address of the loaded PE image
  * @return Pointer to .CRT section or NULL if not found
  */
-uint8_t* FindCRTSection(uint8_t* base) {
-    // Validate DOS header
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) 
-        return NULL;
+typedef void (__cdecl *CRT_INIT_FUNC)(void);
 
-    // Locate NT headers
-    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) 
-        return NULL;
+void CallCRTInitializers(LPBYTE moduleBase)
+{
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)moduleBase;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(moduleBase + dos->e_lfanew);
 
-    // Access file and optional headers
-    IMAGE_FILE_HEADER* fileHeader = &nt->FileHeader;
-    IMAGE_OPTIONAL_HEADER* optionalHeader = &nt->OptionalHeader;
+    PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
+    DWORD numberOfSections = nt->FileHeader.NumberOfSections;
 
-    // Section headers follow the optional header
-    IMAGE_SECTION_HEADER* section = (IMAGE_SECTION_HEADER*)((uint8_t*)optionalHeader + fileHeader->SizeOfOptionalHeader);
+    // Loop through each section to find .CRT
+    for (DWORD i = 0; i < numberOfSections; ++i) {
+        if (strcmp((char*)sections[i].Name, ".CRT") == 0) {
+            LPBYTE crtStart = moduleBase + sections[i].VirtualAddress;
+            DWORD size = sections[i].Misc.VirtualSize;
 
-    // Search for .CRT section
-    for (int i = 0; i < fileHeader->NumberOfSections; i++) {
-        if (strncmp((char*)section[i].Name, ".CRT", 8) == 0) {
-            return base + section[i].PointerToRawData;
+            // Go through the section as an array of function pointers
+            CRT_INIT_FUNC* initArray = (CRT_INIT_FUNC*)crtStart;
+            DWORD count = size / sizeof(CRT_INIT_FUNC);
+
+            for (DWORD j = 0; j < count; ++j) {
+                if (initArray[j]) {
+                    initArray[j](); // Call the constructor
+                }
+            }
+
+            printf(".CRT section processed.\n");
+            return;
         }
     }
 
-    return NULL; // Section not found
+    printf(".CRT section not found.\n");
 }
 
 /**
@@ -921,14 +927,6 @@ void ApplySectionProtections(BYTE* base, pNtProtectVirtualMemory NtProtectVirtua
         }
     }
 
-    // Find and log CRT section if present
-    uint8_t* crtSection = FindCRTSection(base);
-    if (crtSection) {
-        printf("[+] .CRT section found at: %p\n", crtSection);
-    } else {
-        printf("[*] .CRT section not found\n");
-    }
-
     printf("[+] Section protections applied successfully\n");
 }
 
@@ -1091,6 +1089,7 @@ int main(int argc, char* argv[]) {
 
     printf("[+] Applying section protections...\n");
     ApplySectionProtections((BYTE*)peBase, NtProtectVirtualMemory);
+    CallCRTInitializers((BYTE*)peBase);
     
     printf("[+] Processing TLS callbacks...\n");
     ResolveTLS((BYTE*)peBase);
