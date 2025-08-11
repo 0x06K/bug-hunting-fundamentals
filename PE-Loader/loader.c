@@ -243,7 +243,6 @@ BOOL ResolveNTDLLFunctions(FARPROC resolvedFuncs[FUNCTION_COUNT]) {
                 WORD ordinal = ordinals[i];
                 DWORD funcRVA = funcRVAs[ordinal];
                 resolvedFuncs[j] = (FARPROC)((BYTE*)ntdllBase + funcRVA);
-                printf("[+] Resolved %s at 0x%p\n", functionName, resolvedFuncs[j]);
                 break;
             }
         }
@@ -459,97 +458,128 @@ BOOL AllocateAndMapSections(pNtAllocateVirtualMemory NtAllocateVirtualMemory,
  * @param base Base address of loaded PE image
  * @return TRUE if successful, FALSE otherwise
  */
-BOOL ProcessBaseRelocations(BYTE* base) {
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)base;
-    PIMAGE_NT_HEADERS ntHeader = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
+BOOL ProcessBaseRelocations(BYTE* base)
+{
+    if (!base) return FALSE;
 
-    // Check if relocation is needed
-    if (ntHeader->OptionalHeader.ImageBase == (DWORD_PTR)base) {
-        printf("[+] No base relocation needed\n");
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+
+    ULONG_PTR preferredBase = (ULONG_PTR)nt->OptionalHeader.ImageBase;
+    ULONG_PTR actualBase    = (ULONG_PTR)base;
+
+    if (preferredBase == actualBase) {
+        printf("[+] No base relocation needed (loaded at preferred image base)\n");
         return TRUE;
     }
 
-    printf("[+] Base relocation needed (loaded at 0x%p, preferred 0x%llX)\n", 
-           base, ntHeader->OptionalHeader.ImageBase);
+    INT64 delta = (INT64)actualBase - (INT64)preferredBase;
+    printf("[+] Need relocations: preferred=0x%llx actual=0x%llx delta=0x%llx\n",
+           (unsigned long long)preferredBase, (unsigned long long)actualBase, (long long)delta);
 
-    // Calculate delta
-    ptrdiff_t delta = (BYTE*)base - (BYTE*)(ntHeader->OptionalHeader.ImageBase);
-    
-    // Get relocation directory
-    DWORD relocRVA = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
-    DWORD relocSize = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-    
+    DWORD relocRVA  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+    DWORD relocSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
     if (relocRVA == 0 || relocSize == 0) {
-        printf("[-] No relocation data available\n");
+        printf("[-] No relocation directory found\n");
         return FALSE;
     }
 
-    IMAGE_BASE_RELOCATION* relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)base + relocRVA);
-    
-    // Process relocation blocks
-    while (relocSize > 0) {
-        WORD* relocEntries = (WORD*)((BYTE*)relocBase + 8); // Skip header
-        int entryCount = (relocBase->SizeOfBlock - 8) / 2;
-        
-        printf("[+] Processing relocation block at RVA 0x%08X (%d entries)\n", 
-               relocBase->VirtualAddress, entryCount);
+    BYTE* relocBasePtr = base + relocRVA;
+    BYTE* relocEnd     = relocBasePtr + relocSize;
+    IMAGE_BASE_RELOCATION* block = (IMAGE_BASE_RELOCATION*)relocBasePtr;
 
-        for (DWORD i = 0; i < entryCount; i++) {
-            WORD entry = relocEntries[i];
-            WORD type = (entry >> 12) & 0xF;
-            WORD offset = entry & 0xFFF;
-            
-            BYTE* relocAddr = base + relocBase->VirtualAddress + offset;
+    while ((BYTE*)block < relocEnd && block->SizeOfBlock) {
+        DWORD blockVA = block->VirtualAddress;
+        DWORD blockSize = block->SizeOfBlock;
+        if (blockSize < sizeof(IMAGE_BASE_RELOCATION)) {
+            printf("[-] Malformed relocation block (size too small)\n");
+            return FALSE;
+        }
 
-            switch (type) {
-                case IMAGE_REL_BASED_ABSOLUTE:
-                    // No relocation needed
-                    break;
-                case IMAGE_REL_BASED_HIGH:
-                    *(WORD*)relocAddr += HIWORD(delta);
-                    break;
-                case IMAGE_REL_BASED_LOW:
-                    *(WORD*)relocAddr += LOWORD(delta);
-                    break;
-                case IMAGE_REL_BASED_HIGHLOW:
-                    *(DWORD*)relocAddr += (DWORD)delta;
-                    break;
-                case IMAGE_REL_BASED_HIGHADJ:
+        WORD* entries = (WORD*)((BYTE*)block + sizeof(IMAGE_BASE_RELOCATION));
+        int entryCount = (blockSize - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        printf("[+] Reloc block: VA=0x%08X entries=%d\n", blockVA, entryCount);
+
+        for (int i = 0; i < entryCount; ++i) {
+            WORD entry = entries[i];
+            WORD type = entry >> 12;
+            WORD offset = entry & 0x0FFF;
+            BYTE* relocAddr = base + blockVA + offset;
+
+            // Make page writable if necessary
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery(relocAddr, &mbi, sizeof(mbi))) {
+                DWORD oldProt;
+                BOOL changed = FALSE;
+                DWORD prot = mbi.Protect & ~PAGE_GUARD; // mask out guard
+                if (!(prot & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+                    // make it writable
+                    if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &oldProt)) {
+                        changed = TRUE;
+                    } else {
+                        printf("    [!] VirtualProtect failed for %p: %lu\n", mbi.BaseAddress, GetLastError());
+                    }
+                }
+
+                switch (type) {
+                    case IMAGE_REL_BASED_ABSOLUTE:
+                        // no-op
+                        break;
+                    case IMAGE_REL_BASED_HIGH:
                     {
-                        WORD highPart = *(WORD*)relocAddr;
-                        WORD lowPart = relocEntries[++i] & 0xFFFF;
-                        DWORD fullAddr = (highPart << 16) + lowPart + (DWORD)delta;
-                        *(WORD*)relocAddr = HIWORD(fullAddr);
+                        WORD orig = *(WORD*)relocAddr;
+                        WORD newv = (WORD)(orig + HIWORD((LONG_PTR)delta));
+                        *(WORD*)relocAddr = newv;
                     }
                     break;
-                case IMAGE_REL_BASED_MIPS_JMPADDR:
-                    *(DWORD*)relocAddr += (DWORD)delta;
+                    case IMAGE_REL_BASED_LOW:
+                    {
+                        WORD orig = *(WORD*)relocAddr;
+                        WORD newv = (WORD)(orig + LOWORD((LONG_PTR)delta));
+                        *(WORD*)relocAddr = newv;
+                    }
                     break;
-                case 6: // Observed type 6 (likely DIR64 on some systems)
-                case IMAGE_REL_BASED_DIR64:
-                    *(ULONGLONG*)relocAddr += delta;
+                    case IMAGE_REL_BASED_HIGHLOW:
+                    {
+                        DWORD orig = *(DWORD*)relocAddr;
+                        *(DWORD*)relocAddr = (DWORD)(orig + (DWORD)delta);
+                    }
                     break;
-                case IMAGE_REL_BASED_THUMB_MOV32:
-                    *(DWORD*)relocAddr += (DWORD)delta;
+                    case IMAGE_REL_BASED_DIR64:
+                    {
+                        unsigned long long orig = *(unsigned long long*)relocAddr;
+                        *(unsigned long long*)relocAddr = (unsigned long long)(orig + (unsigned long long)delta);
+                    }
                     break;
-                case IMAGE_REL_BASED_MIPS_JMPADDR16:
-                    *(ULONGLONG*)relocAddr += delta;
-                    break;
-                default:
-                    printf("[-] Unsupported relocation type: %d\n", type);
-                    return FALSE;
+                    case IMAGE_REL_BASED_HIGHADJ:
+                        // complex legacy x86 case; not implemented here
+                        printf("    [!] HIGHADJ relocation encountered - unsupported in this implementation\n");
+                        break;
+                    default:
+                        printf("    [!] Unsupported relocation type: %u\n", type);
+                        break;
+                }
+
+                // restore old protection if we changed it
+                if (changed) {
+                    DWORD discard;
+                    VirtualProtect(mbi.BaseAddress, mbi.RegionSize, oldProt, &discard);
+                }
+            } else {
+                printf("    [!] VirtualQuery failed for %p (GetLastError=%lu)\n", relocAddr, GetLastError());
             }
         }
-        
-        relocSize -= relocBase->SizeOfBlock;
-        if (!relocSize) break;
-        relocBase = (IMAGE_BASE_RELOCATION*)((BYTE*)relocBase + relocBase->SizeOfBlock);
+
+        // move to next block
+        block = (IMAGE_BASE_RELOCATION*)((BYTE*)block + block->SizeOfBlock);
     }
 
-    printf("[+] Base relocations applied successfully\n");
+    printf("[+] Relocations applied\n");
     return TRUE;
 }
-
 /**
  * @brief Finds module in PEB loader data
  * @param dllName Name of DLL to find
@@ -643,7 +673,6 @@ BOOL ResolveSingleImport(HMODULE hMod, PIMAGE_IMPORT_BY_NAME import, BOOL isOrdi
         return FALSE;
     }
 
-    printf("[+] Resolved %s -> 0x%p\n", functionName, *procAddr);
     return TRUE;
 }
 
@@ -822,7 +851,16 @@ void ResolveImports(BYTE* base) {
  * @brief Resolves TLS (Thread Local Storage) callbacks
  * @param base Base address of loaded PE image
  */
+/**
+ * @brief Resolves and executes TLS (Thread Local Storage) callbacks
+ * @param base Base address of loaded PE image
+ */
 void ResolveTLS(BYTE* base) {
+    if (!base) {
+        printf("[!] Invalid base address for TLS processing.\n");
+        return;
+    }
+    
     // Parse DOS and NT headers
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -836,58 +874,181 @@ void ResolveTLS(BYTE* base) {
         return;
     }
 
-    // Get TLS Directory RVA
+    // Get TLS Directory RVA and size
     DWORD tlsRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
-    if (tlsRVA == 0) {
+    DWORD tlsSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+    
+    if (tlsRVA == 0 || tlsSize == 0) {
         printf("[*] No TLS directory present.\n");
         return;
     }
 
-    // Convert RVA to pointer in mapped image
+    // Validate TLS directory RVA
+    if (tlsRVA >= nt->OptionalHeader.SizeOfImage) {
+        printf("[!] Invalid TLS directory RVA: 0x%X\n", tlsRVA);
+        return;
+    }
+
+    // Get TLS directory from mapped image (RVA to pointer)
     PIMAGE_TLS_DIRECTORY64 tlsDir = (PIMAGE_TLS_DIRECTORY64)(base + tlsRVA);
+
+    // Validate TLS directory structure
+    if (IsBadReadPtr(tlsDir, sizeof(IMAGE_TLS_DIRECTORY64))) {
+        printf("[!] Invalid TLS directory structure.\n");
+        return;
+    }
 
     if (tlsDir->AddressOfCallBacks == 0) {
         printf("[*] TLS directory present, but no callbacks.\n");
         return;
     }
 
-    // Convert AddressOfCallBacks (VA) to pointer in manually mapped memory
+    printf("[+] TLS Directory found:\n");
+    printf("    StartAddressOfRawData: 0x%llX\n", tlsDir->StartAddressOfRawData);
+    printf("    EndAddressOfRawData: 0x%llX\n", tlsDir->EndAddressOfRawData);
+    printf("    AddressOfIndex: 0x%llX\n", tlsDir->AddressOfIndex);
+    printf("    AddressOfCallBacks: 0x%llX\n", tlsDir->AddressOfCallBacks);
+    printf("    SizeOfZeroFill: 0x%X\n", tlsDir->SizeOfZeroFill);
+    printf("    Characteristics: 0x%X\n", tlsDir->Characteristics);
+
+    // Convert AddressOfCallBacks (VA) to RVA, then to mapped pointer
     ULONG_PTR imageBaseVA = nt->OptionalHeader.ImageBase;
     ULONG_PTR imageBaseMapped = (ULONG_PTR)base;
+    
+    // Convert VA to RVA
+    ULONG_PTR callbacksVA = tlsDir->AddressOfCallBacks;
+    if (callbacksVA < imageBaseVA) {
+        printf("[!] Invalid callback VA: 0x%llX < ImageBase: 0x%llX\n", callbacksVA, imageBaseVA);
+        return;
+    }
+    
+    ULONG_PTR callbacksRVA = callbacksVA - imageBaseVA;
+    if (callbacksRVA >= nt->OptionalHeader.SizeOfImage) {
+        printf("[!] Callback RVA out of bounds: 0x%llX\n", callbacksRVA);
+        return;
+    }
 
-    ULONG_PTR rawCallbackVA = tlsDir->AddressOfCallBacks;
-    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(
-        imageBaseMapped + (rawCallbackVA - imageBaseVA)
-    );
+    // Get pointer to callback array in mapped memory
+    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(base + callbacksRVA);
+
+    // Validate callback list pointer
+    if (IsBadReadPtr(callbackList, sizeof(PIMAGE_TLS_CALLBACK))) {
+        printf("[!] Invalid TLS callback list pointer.\n");
+        return;
+    }
 
     printf("[+] Executing TLS callbacks...\n");
 
-    int i = 0;
-    while (*callbackList != NULL) {
-        printf("    [%d] TLS callback at: 0x%p\n", i, *callbackList);
+    int callbackCount = 0;
+    const int MAX_CALLBACKS = 100; // Safety limit
 
-        // Optional: validate pointer and set execute permission
+    // Execute each callback
+    while (callbackCount < MAX_CALLBACKS && *callbackList != NULL) {
+        PIMAGE_TLS_CALLBACK callback = *callbackList;
+        
+        // Convert callback VA to mapped address
+        ULONG_PTR callbackVA = (ULONG_PTR)callback;
+        if (callbackVA < imageBaseVA) {
+            printf("[!] Invalid callback VA: 0x%p\n", callback);
+            break;
+        }
+        
+        ULONG_PTR callbackRVA = callbackVA - imageBaseVA;
+        if (callbackRVA >= nt->OptionalHeader.SizeOfImage) {
+            printf("[!] Callback RVA out of bounds: 0x%llX\n", callbackRVA);
+            break;
+        }
+        
+        // Get actual callback function pointer in mapped memory
+        PIMAGE_TLS_CALLBACK actualCallback = (PIMAGE_TLS_CALLBACK)(base + callbackRVA);
+        
+        printf("    [%d] TLS callback at: 0x%p (mapped: 0x%p)\n", callbackCount, callback, actualCallback);
+
+        // Ensure the callback memory is executable
         MEMORY_BASIC_INFORMATION mbi;
-        SIZE_T regionSize = 0x1000; // one page
-        DWORD oldProtect;
-        PVOID callbackAddr = *callbackList;
-
-        if (VirtualQuery(callbackAddr, &mbi, sizeof(mbi))) {
-            if (!(mbi.Protect & PAGE_EXECUTE)) {
-                if (VirtualProtect(callbackAddr, regionSize, PAGE_EXECUTE_READ, &oldProtect)) {
-                    printf("    [+] Temporarily set execute permission on TLS callback.\n");
+        if (VirtualQuery(actualCallback, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+                DWORD oldProtect;
+                SIZE_T regionSize = mbi.RegionSize;
+                if (VirtualProtect(mbi.BaseAddress, regionSize, PAGE_EXECUTE_READ, &oldProtect)) {
+                    printf("    [+] Set execute permission for TLS callback region.\n");
                 } else {
-                    printf("    [!] Failed to set execute permission. GetLastError: %lu\n", GetLastError());
+                    printf("    [!] Failed to set execute permission. Error: %lu\n", GetLastError());
+                    break;
                 }
             }
+        } else {
+            printf("    [!] VirtualQuery failed for callback. Error: %lu\n", GetLastError());
+            break;
         }
 
+        // Execute the TLS callback
+
+            printf("    [+] Calling TLS callback %d...\n", callbackCount);
+            actualCallback((PVOID)base, DLL_PROCESS_ATTACH, NULL);
+            printf("    [+] TLS callback %d completed successfully.\n", callbackCount);
+
         callbackList++;
-        i++;
+        callbackCount++;
     }
-    printf("[+] TLS callbacks complete.\n");
+
+    if (callbackCount >= MAX_CALLBACKS) {
+        printf("[!] Warning: Maximum callback limit reached.\n");
+    }
+    
+    printf("[+] TLS processing complete. Executed %d callbacks.\n", callbackCount);
 }
 
+/**
+ * @brief Alternative TLS processing for 32-bit PE files
+ * @param base Base address of loaded PE image
+ */
+void ResolveTLS32(BYTE* base) {
+    if (!base) {
+        printf("[!] Invalid base address for TLS processing.\n");
+        return;
+    }
+    
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS32 nt = (PIMAGE_NT_HEADERS32)(base + dos->e_lfanew);
+    
+    DWORD tlsRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+    if (tlsRVA == 0) {
+        printf("[*] No TLS directory present (32-bit).\n");
+        return;
+    }
+
+    PIMAGE_TLS_DIRECTORY32 tlsDir = (PIMAGE_TLS_DIRECTORY32)(base + tlsRVA);
+    if (tlsDir->AddressOfCallBacks == 0) {
+        printf("[*] TLS directory present, but no callbacks (32-bit).\n");
+        return;
+    }
+
+    // Similar logic as 64-bit version but with 32-bit structures
+    ULONG imageBaseVA = nt->OptionalHeader.ImageBase;
+    ULONG callbacksRVA = tlsDir->AddressOfCallBacks - imageBaseVA;
+    
+    PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(base + callbacksRVA);
+
+    printf("[+] Executing TLS callbacks (32-bit)...\n");
+    
+    int callbackCount = 0;
+    while (*callbackList != NULL && callbackCount < 100) {
+        PIMAGE_TLS_CALLBACK callback = *callbackList;
+        ULONG callbackRVA = (ULONG)callback - imageBaseVA;
+        PIMAGE_TLS_CALLBACK actualCallback = (PIMAGE_TLS_CALLBACK)(base + callbackRVA);
+        
+        printf("    [%d] TLS callback (32-bit) at: 0x%p\n", callbackCount, actualCallback);
+        
+
+            actualCallback((PVOID)base, DLL_PROCESS_ATTACH, NULL);
+
+        callbackList++;
+        callbackCount++;
+    }
+    
+    printf("[+] TLS processing complete (32-bit). Executed %d callbacks.\n", callbackCount);
+}
 /**
  * @brief Applies proper memory protection to PE sections
  * @param base Base address of loaded PE image
