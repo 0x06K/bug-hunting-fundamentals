@@ -69,18 +69,20 @@ void ResolveTLS(BYTE* base) {
     ULONG_PTR imageBaseMapped = (ULONG_PTR)base;
     
     // Convert VA to RVA
-    ULONG_PTR callbacksVA = tlsDir->AddressOfCallBacks;
-    if (callbacksVA < imageBaseVA) {
-        printf("[!] Invalid callback VA: 0x%llX < ImageBase: 0x%llX\n", callbacksVA, imageBaseVA);
+    uintptr_t tlsCallbacksVA = tlsDir->AddressOfCallBacks;
+
+    if (tlsCallbacksVA == 0 || tlsCallbacksVA < imageBaseVA) {
+        printf("[!] Invalid callback VA: 0x%llX < ImageBase: 0x%llX\n", tlsCallbacksVA, imageBaseVA);
         return;
     }
-    
-    ULONG_PTR callbacksRVA = callbacksVA - imageBaseVA;
+
+    uintptr_t callbacksRVA = tlsCallbacksVA - imageBaseVA;
+
     if (callbacksRVA >= nt->OptionalHeader.SizeOfImage) {
         printf("[!] Callback RVA out of bounds: 0x%llX\n", callbacksRVA);
         return;
     }
-
+    
     // Get pointer to callback array in mapped memory
     PIMAGE_TLS_CALLBACK* callbackList = (PIMAGE_TLS_CALLBACK*)(base + callbacksRVA);
 
@@ -186,7 +188,7 @@ void ResolveTLS32(BYTE* base) {
     int callbackCount = 0;
     while (*callbackList != NULL && callbackCount < 100) {
         PIMAGE_TLS_CALLBACK callback = *callbackList;
-        ULONG callbackRVA = (ULONG)callback - imageBaseVA;
+        uintptr_t callbackRVA = (uintptr_t)callback - (uintptr_t)imageBaseVA;
         PIMAGE_TLS_CALLBACK actualCallback = (PIMAGE_TLS_CALLBACK)(base + callbackRVA);
         
         printf("    [%d] TLS callback (32-bit) at: 0x%p\n", callbackCount, actualCallback);
