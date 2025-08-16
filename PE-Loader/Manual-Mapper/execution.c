@@ -32,6 +32,6 @@ void JumpToEntryPoint(BYTE* base) {
     // Direct call (transfers control to loaded PE)
     printf("[+] Jumping to entry point...\n");
     
-    ((void(*)())entryPoint
+    (void(*)())entryPoint;
 
 }
