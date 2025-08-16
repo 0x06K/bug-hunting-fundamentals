@@ -68,23 +68,7 @@ pe_loader/
 ### Build Commands
 
 ```bash
-# Build with GCC (default)
-make
-
-# Build with GCC explicitly
-make gcc
-
-# Build with MSVC
-make msvc
-
-# Debug build
-make debug
-
-# Clean build artifacts
-make clean
-
-# Show available targets
-make help
+gcc *.c -o manual-mapper.exe
 ```
 
 ## Usage
