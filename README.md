@@ -1,3 +1,3 @@
 ## bug-hunting-fundamentals
-- In this repo i will be working on absolute web-pentesting-fundamentals.
-- I will build things from scratch to grasp the core concepts.
+- In this repo, I will focus on the fundamentals of web penetration testing.
+- I will build everything from scratch to fully grasp the core concepts.
