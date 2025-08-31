@@ -115,7 +115,6 @@ void handle_client(int client_fd) {
         return;
     }
 
-
     request_parse(const char *raw_request, http_request_t *request)
     send(client_fd, response, len, 0);
 
