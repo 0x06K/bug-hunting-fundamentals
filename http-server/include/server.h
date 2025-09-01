@@ -1,9 +1,6 @@
 #ifndef SERVER_H
 #define SERVER_H
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-
 #define DEFAULT_PORT 8080
 #define BACKLOG 10
 #define MAX_CLIENTS 100
