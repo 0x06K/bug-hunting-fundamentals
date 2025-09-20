@@ -13,6 +13,7 @@ typedef enum {
 } log_level_t;
 
 // String utilities
+int str_compare_ignore_case(const char *s1, const char *s2);
 char* str_trim(char *str);
 char* str_trim_left(char *str);
 char* str_trim_right(char *str);
@@ -36,8 +37,8 @@ const char* get_mime_type(const char *filepath);
 // Network utilities
 int socket_set_nonblocking(int fd);
 int socket_set_reuseaddr(int fd);
-ssize_t socket_recv_all(int fd, char *buffer, size_t size, int timeout_ms);
-ssize_t socket_send_all(int fd, const char *buffer, size_t size);
+size_t socket_recv_all(int fd, char *buffer, size_t size, int timeout_ms);
+size_t socket_send_all(int fd, const char *buffer, size_t size);
 
 // Time utilities
 void get_timestamp_string(char *buffer, size_t buffer_size);
